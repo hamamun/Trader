@@ -25,7 +25,7 @@ struct CFStream
 };
 
 CFStream streams[2];
-double tick_size;
+double chart_tick_size;
 int csv = INVALID_HANDLE;
 bool log_error = false;
 bool show_panel = false;
@@ -93,16 +93,16 @@ void EndForecast(CFStream &s, const datetime event_bar)
 void ProcessClosed(CFStream &s, const MqlRates &rates[], const int index, const string event,
                    const bool allow_start)
 {
-   CFWindow w;
+   CFWindow w = {};
    for(int i = 0; i < CF_HISTORY; ++i) w.bar[i] = rates[index + i];
    s.last_bar = w.bar[0].time;
    s.waiting_for_new_close = !allow_start;
    if(s.forecast.status == CF_ACTIVE)
    {
-      CFAdvance(s.forecast, w.bar[0], tick_size);
+      CFAdvance(s.forecast, w.bar[0], chart_tick_size);
       if(s.forecast.status != CF_ACTIVE) EndForecast(s, s.last_bar);
    }
-   CFRead(w, tick_size, s.reading);
+   CFRead(w, chart_tick_size, s.reading);
    Log(event, s, s.reading, s.last_bar, 0, -1, CF_IDLE);
    if(!allow_start || s.reading.decision != CF_SETUP || s.forecast.status == CF_ACTIVE) return;
 
@@ -294,9 +294,9 @@ void ResetStream(CFStream &s, const ENUM_TIMEFRAMES period, const bool enabled)
 
 int OnInit()
 {
-   tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(tick_size <= 0) tick_size = _Point;
-   if(tick_size <= 0) return INIT_FAILED;
+   chart_tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(chart_tick_size <= 0) chart_tick_size = _Point;
+   if(chart_tick_size <= 0) return INIT_FAILED;
    ResetStream(streams[0], PERIOD_M5, ReadM5);
    ResetStream(streams[1], PERIOD_M15, ReadM15);
    log_error = false;
