@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.40"
+#property version   "1.41"
 #property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
 
 #include "CandleLogic.mqh"
@@ -13,7 +13,6 @@ input bool CompareSwings   = true;  // Log the standalone confirmed-swing compar
 input bool CompareVariants = true;  // Log the other experiments and all upgrades together
 
 #define CF_OBJECTS "CandleForecast."
-#define CF_CATCHUP 256
 #define CF_TRIAL_COUNT 6
 
 struct CFStream
@@ -167,6 +166,16 @@ void LogManaged(const string event, const CFStream &s, const datetime bar_time, 
        s.period == PERIOD_M5 ? CFMarketName(s.higher_market) : "");
 }
 
+bool ValidRates(const MqlRates &rates[], const int count)
+{
+   for(int i = 0; i < count; ++i)
+   {
+      if(!CFValidBar(rates[i])) return false;
+      if(i > 0 && rates[i].time >= rates[i - 1].time) return false;
+   }
+   return true;
+}
+
 // Resolve the M15 snapshot as of this specific M5 close, including catch-up.
 // Never substitute today's latest M15 bar when reading an older M5 candle.
 CFMarket HigherContext(const datetime cutoff)
@@ -186,7 +195,8 @@ CFMarket HigherContext(const datetime cutoff)
    ArraySetAsSeries(context_rates, true);
    const int copied = CopyRates(_Symbol, PERIOD_M15, shift, CF_HISTORY, context_rates);
    if(copied != CF_HISTORY || context_rates[0].time != open ||
-      !SeriesInfoInteger(_Symbol, PERIOD_M15, SERIES_SYNCHRONIZED)) return CF_MARKET_UNKNOWN;
+      !SeriesInfoInteger(_Symbol, PERIOD_M15, SERIES_SYNCHRONIZED) ||
+      !ValidRates(context_rates, copied)) return CF_MARKET_UNKNOWN;
    CFWindow context = {};
    for(int i = 0; i < CF_HISTORY; ++i) context.bar[i] = context_rates[i];
    higher_cache_market = CFReadMarket(context, chart_tick_size, true);
@@ -203,7 +213,14 @@ void UpdateManaged(CFStream &s, const CFWindow &w, const bool allow_start)
    s.higher_market = s.period == PERIOD_M5 ? HigherContext(w.bar[0].time + PeriodSeconds(s.period)) : CF_MARKET_UNKNOWN;
    s.plan = s.reading;
    if(old_status != CF_ACTIVE)
+   {
       CFContextualPlan(s.planner, w, chart_tick_size, s.local_market, s.higher_market, allow_start, s.plan);
+      if(!allow_start && s.plan.decision == CF_SETUP)
+      {
+         s.plan.decision = CF_WAIT;
+         s.plan.qualifier = "Entry needs a fresh close";
+      }
+   }
    CFManageOnBar(s.managed, w, s.plan, chart_tick_size, allow_start);
    const string observed_close = Price(w.bar[0].close);
    if(old_status == CF_ACTIVE && s.managed.forecast.status != CF_ACTIVE)
@@ -259,8 +276,9 @@ void ProcessClosed(CFStream &s, const MqlRates &rates[], const int index, const 
 bool UpdateStream(CFStream &s)
 {
    if(!s.enabled) return false;
+   const datetime current_open = iTime(_Symbol, s.period, 0);
    const datetime newest = iTime(_Symbol, s.period, 1);
-   if(newest == 0 || newest == s.last_bar) return false;
+   if(current_open <= newest || newest == 0 || newest <= s.last_bar) return false;
 
    int count = CF_HISTORY;
    if(s.last_bar != 0)
@@ -274,13 +292,13 @@ bool UpdateStream(CFStream &s)
    const int copied = CopyRates(_Symbol, s.period, 1, count, rates);
    if(copied < CF_HISTORY || !SeriesInfoInteger(_Symbol, s.period, SERIES_SYNCHRONIZED)) return false;
    // A new candle may have appeared during the copy. Recalculate the required history next pass.
-   if(rates[0].time != newest) return false;
+   if(rates[0].time != newest || iTime(_Symbol, s.period, 0) != current_open ||
+      !ValidRates(rates, copied)) return false;
    if(s.last_bar == 0)
    {
       ProcessClosed(s, rates, 0, "initial_reading", false);
       return true;
    }
-   if(newest < s.last_bar) return false;
 
    int overlap = -1;
    for(int i = 1; i < copied; ++i)
@@ -289,11 +307,26 @@ bool UpdateStream(CFStream &s)
       overlap = i;
       break;
    }
-   if(overlap > 0 && overlap <= CF_CATCHUP && copied >= overlap + CF_HISTORY - 1)
+   if(overlap < 0)
    {
-      // Catch up chronologically. Don't create forecasts for candles already missed.
+      // CopyRates can make more history available after the first anchor lookup.
+      // Retry with the longer request if the anchor now exists inside our cap.
+      const int loaded_shift = iBarShift(_Symbol, s.period, s.last_bar, true);
+      if(loaded_shift > 1 && loaded_shift <= CF_CATCHUP + 1 && copied < CF_HISTORY + loaded_shift - 2)
+         return false;
+   }
+   const CFHistoryState replay = CFReplayState(copied, count, overlap);
+   if(replay == CF_HISTORY_RETRY) return false;
+   if(replay == CF_HISTORY_READY)
+   {
+      // Replay older closes for outcomes only. Even the latest closed candle
+      // may be stale if the next bar opened after a weekend/session gap.
+      const bool fresh = CFFreshClose(newest, current_open, PeriodSeconds(s.period));
       for(int i = overlap - 1; i >= 0; --i)
-         ProcessClosed(s, rates, i, i == 0 ? "reading" : "catchup_reading", i == 0);
+      {
+         const string event = i > 0 ? "catchup_reading" : (fresh ? "reading" : "session_gap_reading");
+         ProcessClosed(s, rates, i, event, i == 0 && fresh);
+      }
    }
    else
    {
