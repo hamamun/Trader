@@ -107,7 +107,328 @@ void lifecycle(CFReading r) {
     assert(f.status == CF_TARGET && f.bars == r.max_bars); // The expiry bar can still touch a level.
 }
 
+void swing_comparison() {
+    auto w = range();
+    set(w,0,97.5,98.3,96.6,97.9);
+    auto original = expect(w, CF_RANGE_BOUNCE, CF_SETUP, 1);
+    auto comparison = original;
+    CFRequireConfirmedSwing(w, tick, comparison);
+    assert(comparison.decision == CF_SKIP); // Repeated equal lows do not make a strict swing.
+    assert(expect(w, CF_RANGE_BOUNCE, CF_SETUP, 1).target == original.target);
+
+    set(w,3,98.2,99,96.55,97.9);
+    for (int direction : {1, -1}) {
+        const auto bars = direction > 0 ? w : reflect(w);
+        const auto base = expect(bars, CF_RANGE_BOUNCE, CF_SETUP, direction);
+        comparison = base;
+        CFRequireConfirmedSwing(bars, tick, comparison);
+        assert(comparison.decision == CF_SETUP && comparison.qualifier == "Rejection at a confirmed swing level");
+        assert(comparison.target == base.target && comparison.invalidation == base.invalidation);
+        assert(comparison.min_bars == base.min_bars && comparison.max_bars == base.max_bars);
+    }
+
+    // Isolate the location check from the baseline classifier in these fixtures.
+    w = baseline();
+    set(w,0,99,100,97.1,99.5);
+    set(w,2,99,101,97.0,100);
+    comparison = original;
+    CFRequireConfirmedSwing(w, tick, comparison);
+    assert(comparison.decision == CF_SKIP); // Only one newer bar before the bounce.
+    set(w,2,100,102,98,100);
+    set(w,5,99,101,97.0,100);
+    comparison = original;
+    CFRequireConfirmedSwing(w, tick, comparison);
+    assert(comparison.decision == CF_SETUP);
+    set(w,1,98,99,95.8,95.9);
+    comparison = original;
+    CFRequireConfirmedSwing(w, tick, comparison);
+    assert(comparison.decision == CF_SKIP); // A later close already broke support.
+
+    // For reversals, the rejection bar is one bar earlier than the signal close.
+    w = baseline();
+    set(w,0,99.2,101.5,98.8,101.2);
+    set(w,1,98.6,99.8,97.1,99.2);
+    set(w,3,99,101,97.0,100);
+    original.category = CF_REVERSAL;
+    comparison = original;
+    CFRequireConfirmedSwing(w, tick, comparison);
+    assert(comparison.decision == CF_SKIP); // The rejection cannot double as pivot confirmation.
+    set(w,3,100,102,98,100);
+    set(w,4,99,101,97.0,100);
+    comparison = original;
+    CFRequireConfirmedSwing(w, tick, comparison);
+    assert(comparison.decision == CF_SETUP);
+
+    comparison = original;
+    comparison.category = CF_BREAKOUT;
+    CFRequireConfirmedSwing(w, tick, comparison);
+    assert(comparison.decision == CF_SETUP && comparison.qualifier == original.qualifier);
+}
+
+void breakout_experiments(const int direction) {
+    auto w = baseline();
+    set(w,0,100.4,103.5,100,103.0);
+    const auto initial = direction > 0 ? w : reflect(w);
+    const auto signal = expect(initial, CF_BREAKOUT, CF_SETUP, direction);
+    const int flags = CF_SWING_FILTER | CF_REVERSAL_CONFIRM | CF_BREAKOUT_RETEST |
+                      CF_BREAKOUT_FAILURE | CF_EARLY_WARNING;
+    CFTrial trial{};
+    auto reading = signal;
+    CFTrialRead(trial, initial, tick, flags, false, reading);
+    assert(trial.pending_bars == 0); // Startup/replayed closes cannot start a candidate.
+    CFTrialRead(trial, initial, tick, flags, true, reading);
+    assert(reading.decision == CF_WAIT && trial.pending_bars == 3);
+    const auto waiting = trial;
+    set(w,0,103,104,102,102.4);
+    auto closed = direction > 0 ? w : reflect(w);
+    CFTrialRead(trial, closed, tick, flags, true, reading);
+    assert(reading.decision == CF_SETUP && trial.pending_bars == 0);
+    assert(reading.entry == closed.bar[0].close && reading.target == signal.target);
+    assert(reading.breakout_level == signal.breakout_level);
+    const auto retested = reading;
+    trial = waiting;
+    set(w,0,103,105.6,102,105.5); // Retest held, but the confirmation is too close to the target.
+    closed = direction > 0 ? w : reflect(w);
+    CFTrialRead(trial, closed, tick, flags, true, reading);
+    assert(reading.decision == CF_SKIP && reading.qualifier == "Too little room before the next objective");
+    CFForecast control{}, experiment{};
+    CFStart(control, retested, 9000);
+    CFStart(experiment, retested, 9000);
+    set(w,0,102.1,102.5,101.9,101.95); // Closes one tick inside; no target or stop touch.
+    closed = direction > 0 ? w : reflect(w);
+    CFAdvanceTrial(control, closed, tick, 0);
+    CFAdvanceTrial(experiment, closed, tick, flags);
+    assert(experiment.status == CF_BREAKOUT_EXIT && control.status == CF_ACTIVE);
+    trial = waiting;
+    CFTrialRead(trial, closed, tick, flags, true, reading);
+    assert(reading.decision == CF_SKIP && trial.pending_bars == 0);
+
+    trial = waiting;
+    set(w,0,103,107,102,103.5);
+    closed = direction > 0 ? w : reflect(w);
+    CFTrialRead(trial, closed, tick, flags, true, reading);
+    assert(reading.decision == CF_SKIP && reading.qualifier == "Target already touched before entry");
+    trial = waiting;
+    for (int left = 2; left >= 0; --left) {
+        set(w,0,103.4,104,103.3,103.5); // No return to the original level.
+        closed = direction > 0 ? w : reflect(w);
+        CFTrialRead(trial, closed, tick, flags, true, reading);
+        assert(trial.pending_bars == left && reading.decision == (left ? CF_WAIT : CF_SKIP));
+    }
+}
+
+void structure_experiments(const int direction) {
+    CFReading signal{};
+    signal.category = CF_REVERSAL;
+    signal.decision = CF_SETUP;
+    signal.direction = direction;
+    signal.entry = 100 + direction;
+    signal.invalidation = 100 - 3*direction;
+    signal.target = 100 + 10*direction;
+    signal.max_bars = 12;
+    auto w = baseline();
+    set(w,4,100,103,98,101);
+    set(w,10,100,104,98,101);
+    auto closed = direction > 0 ? w : reflect(w);
+    CFTrial trial{};
+    auto reading = signal;
+    CFTrialRead(trial, closed, tick, CF_REVERSAL_CONFIRM, true, reading);
+    assert(reading.decision == CF_WAIT && trial.pending_bars == 3);
+    assert(trial.pending_level == 100 + 3*direction);
+    set(w,0,102,103.15,101,103.05);
+    closed = direction > 0 ? w : reflect(w);
+    CFTrialRead(trial, closed, tick, CF_REVERSAL_CONFIRM, true, reading);
+    assert(reading.decision == CF_SETUP && reading.entry == closed.bar[0].close);
+    assert(reading.target == signal.target && trial.pending_bars == 0);
+
+    for (int j=0; j<CF_HISTORY; ++j) set(w,j,101,102,100,101);
+    set(w,3,101,102,99,101);
+    set(w,8,101,102,98,101);
+    CFForecast experiment{};
+    CFStart(experiment, signal, 9000);
+    set(w,0,101,102,98.7,99.2);
+    closed = direction > 0 ? w : reflect(w);
+    CFAdvanceTrial(experiment, closed, tick, CF_EARLY_WARNING);
+    assert(experiment.status == CF_ACTIVE); // A wick alone isn't an exit.
+    CFStart(experiment, signal, 9000);
+    set(w,0,101,102,98.7,98.95);
+    closed = direction > 0 ? w : reflect(w);
+    CFAdvanceTrial(experiment, closed, tick, CF_EARLY_WARNING);
+    assert(experiment.status == CF_STRUCTURE_EXIT);
+    CFStart(experiment, signal, 9000);
+    set(w,0,101,102,96,98.95);
+    closed = direction > 0 ? w : reflect(w);
+    CFAdvanceTrial(experiment, closed, tick, CF_EARLY_WARNING);
+    assert(experiment.status == CF_INVALIDATED); // Intrabar invalidation precedes a warning at the close.
+}
+
+void managed_forecast(const int direction) {
+    auto w = baseline();
+    CFReading signal{};
+    signal.category = CF_REVERSAL;
+    signal.decision = CF_SETUP;
+    signal.direction = direction;
+    signal.entry = 100;
+    signal.invalidation = 100 - 6*direction;
+    signal.target = 100 + 10*direction;
+    signal.max_bars = 10;
+    auto opposite = signal;
+    opposite.direction = -direction;
+    opposite.invalidation = signal.target;
+    opposite.target = signal.invalidation;
+    CFReading neutral{};
+    CFRead(w, tick, neutral);
+    CFManaged managed{};
+    set(w,0,99,100.5,97,100);
+    w.bar[0].time = 9000;
+    auto bar = direction > 0 ? w : reflect(w);
+    CFManageOnBar(managed, bar, signal, tick, false);
+    assert(managed.forecast.status == CF_IDLE);
+    CFManageOnBar(managed, bar, signal, tick, true);
+    assert(managed.forecast.status == CF_ACTIVE && managed.advice == CF_NEW);
+    set(w,0,100,104,99,103);
+    w.bar[0].time = 9300;
+    bar = direction > 0 ? w : reflect(w);
+    CFManageOnBar(managed, bar, neutral, tick, true);
+    assert(managed.advice == CF_SUPPORTED);
+    const auto holding = managed;
+
+    set(w,1,104,107,103.9,106);
+    set(w,0,105,108,103.8,104.3);
+    w.bar[0].time = 9600;
+    bar = direction > 0 ? w : reflect(w);
+    CFManageOnBar(managed, bar, neutral, tick, true);
+    assert(managed.advice == CF_WATCH && managed.warning_bars == 2);
+    CFManageOnBar(managed, bar, neutral, tick, true); // Repeated data does not age the warning.
+    assert(managed.warning_bars == 2 && managed.forecast.bars == 2);
+    assert(managed.forecast.setup.target == signal.target && managed.forecast.setup.invalidation == signal.invalidation);
+    const auto watching = managed;
+
+    set(w,0,104,104.4,102.7,103.2);
+    bar = direction > 0 ? w : reflect(w);
+    CFManageOnBar(managed, bar, opposite, tick, true);
+    assert(managed.advice == CF_EXIT && managed.forecast.status == CF_CANDLE_EXIT);
+    assert(direction * (bar.bar[0].close - signal.entry) > 0); // An early exit can preserve some of the price move.
+    CFManageOnBar(managed, bar, opposite, tick, true);
+    assert(managed.forecast.status == CF_CANDLE_EXIT); // Never flip on the exit bar.
+    bar.bar[0].time += 300;
+    CFManageOnBar(managed, bar, opposite, tick, true);
+    assert(managed.advice == CF_NEW && managed.forecast.setup.direction == -direction);
+
+    managed = watching;
+    set(w,0,104.3,109,104,108.6);
+    bar = direction > 0 ? w : reflect(w);
+    CFManageOnBar(managed, bar, neutral, tick, true);
+    assert(managed.advice == CF_HOLD && managed.warning_bars == 0);
+    managed = watching;
+    set(w,0,104,110,102,105);
+    bar = direction > 0 ? w : reflect(w);
+    CFManageOnBar(managed, bar, opposite, tick, true);
+    assert(managed.forecast.status == CF_TARGET); // Intrabar target beats a close-based decision.
+
+    managed = holding;
+    set(w,1,104,108,103,106);
+    set(w,0,107,107.4,100.6,101.1);
+    w.bar[0].time = 9600;
+    bar = direction > 0 ? w : reflect(w);
+    CFManageOnBar(managed, bar, opposite, tick, true);
+    assert(managed.forecast.status == CF_CANDLE_EXIT && managed.advice == CF_EXIT);
+}
+
+void contextual_planning(const int direction) {
+    assert(CFClosedBy(9000, 900, 9900));
+    assert(!CFClosedBy(9000, 900, 9899));
+    assert(!CFClosedBy(0, 900, 9900));
+    assert(CFReadMarket(range(), tick, false) == CF_MARKET_RANGE);
+    assert(CFReadMarket(baseline(), tick, false) == CF_MARKET_MIXED);
+    auto w = baseline();
+    for (int i = 0; i < CF_HISTORY; ++i) set(w,i,100-i,100.5-i,99.5-i,100-i);
+    const CFMarket trend = direction > 0 ? CF_MARKET_UP : CF_MARKET_DOWN;
+    const CFMarket against = direction > 0 ? CF_MARKET_DOWN : CF_MARKET_UP;
+    auto bars = direction > 0 ? w : reflect(w);
+    assert(CFReadMarket(bars, tick, false) == trend);
+    set(w,0,99,101,80,82); // The latest candle cannot rewrite the context used to judge itself.
+    bars = direction > 0 ? w : reflect(w);
+    assert(CFReadMarket(bars, tick, false) == trend);
+
+    CFTrial plan{};
+    CFReading r{};
+    r.category = CF_CONTINUATION;
+    r.decision = CF_SETUP;
+    r.direction = direction;
+    auto candidate = r;
+    CFContextualPlan(plan, bars, tick, trend, against, true, candidate);
+    assert(candidate.decision == CF_SKIP);
+    candidate = r;
+    CFContextualPlan(plan, bars, tick, CF_MARKET_MIXED, CF_MARKET_UNKNOWN, true, candidate);
+    assert(candidate.decision == CF_SKIP);
+    candidate = r;
+    CFContextualPlan(plan, bars, tick, trend, CF_MARKET_UNKNOWN, true, candidate);
+    assert(candidate.decision == CF_SETUP && plan.pending_bars == 0);
+
+    w = baseline();
+    set(w,0,100.4,103.5,100,103.0);
+    bars = direction > 0 ? w : reflect(w);
+    const auto broken = expect(bars, CF_BREAKOUT, CF_SETUP, direction);
+    candidate = broken;
+    CFContextualPlan(plan, bars, tick, CF_MARKET_RANGE, CF_MARKET_UNKNOWN, true, candidate);
+    assert(candidate.decision == CF_SETUP);
+    candidate = broken;
+    CFContextualPlan(plan, bars, tick, trend, against, true, candidate);
+    assert(candidate.decision == CF_WAIT && plan.pending_bars == 3 && plan.pending_level == broken.breakout_level);
+    plan.pending_bars = 0;
+    candidate = broken;
+    candidate.entry = broken.breakout_level + 5 * direction;
+    CFContextualPlan(plan, bars, tick, trend, CF_MARKET_UNKNOWN, true, candidate);
+    assert(candidate.decision == CF_WAIT);
+
+    plan.pending_bars = 0;
+    candidate = broken;
+    candidate.category = CF_FAILED_BREAKOUT;
+    candidate.target = 100 + 10*direction;
+    candidate.invalidation = 100 - 3*direction;
+    CFContextualPlan(plan, bars, tick, against, CF_MARKET_UNKNOWN, true, candidate);
+    assert(candidate.decision == CF_WAIT && plan.pending_bars == 3);
+    const auto trigger = plan.pending_level;
+    set(w,0,103,104.5,102,104.2);
+    bars = direction > 0 ? w : reflect(w);
+    CFContextualPlan(plan, bars, tick, against, CF_MARKET_UNKNOWN, true, candidate);
+    assert(candidate.decision == CF_SKIP); // Genuine follow-through still needs room for the risk.
+    assert(direction * (candidate.entry - trigger) > 0 && plan.pending_bars == 0);
+}
+
+void stalled_management() {
+    auto w = baseline();
+    CFReading candidate{};
+    candidate.category = CF_REVERSAL;
+    candidate.decision = CF_SETUP;
+    candidate.direction = 1;
+    candidate.entry = 100;
+    candidate.target = 110;
+    candidate.invalidation = 95;
+    candidate.min_bars = 3;
+    candidate.max_bars = 10;
+    CFManaged managed{};
+    CFManageOnBar(managed, w, candidate, tick, true);
+    CFReading neutral{};
+    for (int i = 1; i <= 3; ++i) {
+        set(w,0,100,100.4,99.6,100);
+        w.bar[0].time += 300*i;
+        CFManageOnBar(managed, w, neutral, tick, true);
+    }
+    assert(managed.advice == CF_WATCH && managed.forecast.status == CF_ACTIVE);
+    assert(managed.explanation == "Move stalled; watching for an adverse close");
+}
+
 int main() {
+    stalled_management();
+    for (int direction : {1, -1}) {
+        breakout_experiments(direction);
+        structure_experiments(direction);
+        managed_forecast(direction);
+        contextual_planning(direction);
+    }
+    swing_comparison();
     auto w = baseline();
     expect(w, CF_NONE, CF_SKIP, 0);
     set(w,0,100.4,103.5,100,103.0);
@@ -173,5 +494,5 @@ int main() {
     set(w,0,102,102.5,101.9,102.2);
     both(w, CF_CONTINUATION, CF_WAIT, 1);
 
-    std::cout << "Candle logic: five categories, mirrored directions, qualification, forecast windows and outcomes passed.\n";
+    std::cout << "Candle logic: five categories, mirrored directions, qualification, forecast windows, outcomes, side-by-side experiments, managed advice, and contextual planning passed.\n";
 }
