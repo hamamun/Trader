@@ -4,10 +4,13 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <random>
 #include <string>
 using string = std::string;
 using datetime = long long;
 struct MqlRates { datetime time; double open, high, low, close; };
+bool MathIsValidNumber(double a) { return std::isfinite(a); }
 double MathAbs(double a) { return std::abs(a); }
 double MathMin(double a, double b) { return std::min(a, b); }
 double MathMax(double a, double b) { return std::max(a, b); }
@@ -420,7 +423,99 @@ void stalled_management() {
     assert(managed.explanation == "Move stalled; watching for an adverse close");
 }
 
+void closed_history_checks() {
+    for (const int timeframe : {300, 900}) {
+        assert(CFFreshClose(9000, 9000 + timeframe, timeframe));
+        assert(!CFFreshClose(9000, 9000 + timeframe + 86400, timeframe));
+        assert(!CFFreshClose(9000, 9000, timeframe));
+        assert(!CFFreshClose(0, timeframe, timeframe));
+    }
+    // Test both sides of the oldest replayed bar's lookback boundary.
+    assert(CFReplayState(CF_HISTORY, CF_HISTORY + 1, 1) == CF_HISTORY_READY);
+    assert(CFReplayState(CF_HISTORY + 2, CF_HISTORY + 4, 4) == CF_HISTORY_RETRY);
+    assert(CFReplayState(CF_HISTORY + 3, CF_HISTORY + 4, 4) == CF_HISTORY_READY);
+    assert(CFReplayState(CF_HISTORY, CF_HISTORY + 25, -1) == CF_HISTORY_RETRY);
+    assert(CFReplayState(CF_HISTORY, CF_HISTORY, -1) == CF_HISTORY_GAP);
+    assert(CFReplayState(CF_HISTORY + CF_CATCHUP, CF_HISTORY + CF_CATCHUP, CF_CATCHUP) == CF_HISTORY_READY);
+    assert(CFReplayState(CF_HISTORY + CF_CATCHUP + 1, CF_HISTORY + CF_CATCHUP + 1,
+                         CF_CATCHUP + 1) == CF_HISTORY_GAP);
+    assert(CFReplayState(CF_HISTORY - 1, CF_HISTORY, -1) == CF_HISTORY_RETRY);
+
+    MqlRates bar{9000,-1,1,-4,0}; // Negative/zero prices aren't inherently malformed.
+    assert(CFValidBar(bar));
+    bar.low = 0.5;
+    assert(!CFValidBar(bar));
+    bar.low = -4;
+    bar.close = std::numeric_limits<double>::quiet_NaN();
+    assert(!CFValidBar(bar));
+    bar.close = 0;
+    bar.time = 0;
+    assert(!CFValidBar(bar));
+
+    CFManaged managed{};
+    CFReading reading{};
+    reading.decision = CF_WAIT;
+    reading.qualifier = "Waiting for a retest of the original breakout level";
+    CFManageOnBar(managed, baseline(), reading, tick, true);
+    assert(managed.forecast.status == CF_IDLE && managed.advice == CF_STANDBY);
+    assert(managed.explanation == reading.qualifier);
+}
+
+void check_setup_invariants(const CFReading &reading) {
+    if(reading.decision != CF_SETUP) return;
+    assert(reading.direction == 1 || reading.direction == -1);
+    assert(reading.category != CF_NONE);
+    const double risk = reading.direction * (reading.entry - reading.invalidation);
+    const double reward = reading.direction * (reading.target - reading.entry);
+    assert(std::isfinite(risk) && std::isfinite(reward));
+    assert(risk > 0 && reward >= 1.10 * risk);
+    assert(reading.min_bars > 0 && reading.max_bars > reading.min_bars && reading.max_bars <= 18);
+}
+
+void stream_smoke_test() {
+    // Fixture-independent audit: replay multiple deterministic price paths with
+    // varying movement, exercise plan & management together, and assert invariants.
+    std::mt19937 rng(20261119);
+    CFWindow w = baseline();
+    CFTrial planner{};
+    CFManaged managed{};
+    int starts = 0, ends = 0;
+    for(int i = 0; i < 20000; ++i) {
+        for(int j = CF_HISTORY - 1; j > 0; --j) w.bar[j] = w.bar[j - 1];
+        const double o = w.bar[1].close;
+        const int bias = ((i / 41) % 3 - 1) * 7;
+        const double c = o + (static_cast<int>(rng() % 61) - 30 + bias) * tick;
+        w.bar[0] = {w.bar[1].time + 300, o, std::max(o,c) + (rng() % 12)*tick,
+                    std::min(o,c) - (rng() % 12)*tick, c};
+        assert(CFValidBar(w.bar[0]));
+        CFReading reading{};
+        CFRead(w, tick, reading);
+        check_setup_invariants(reading);
+        const bool was_active = managed.forecast.status == CF_ACTIVE;
+        const auto original = managed.forecast;
+        const bool fresh = i % 19 != 0;
+        if(!was_active) CFContextualPlan(planner, w, tick, CFReadMarket(w, tick, false),
+                                       CF_MARKET_UNKNOWN, fresh, reading);
+        check_setup_invariants(reading);
+        CFManageOnBar(managed, w, reading, tick, fresh);
+        if(was_active) {
+            assert(managed.forecast.signal_bar == original.signal_bar);
+            assert(managed.forecast.setup.target == original.setup.target);
+            assert(managed.forecast.setup.invalidation == original.setup.invalidation);
+            assert(managed.forecast.bars == original.bars + 1);
+            if(managed.forecast.status != CF_ACTIVE) ++ends;
+        } else if(managed.forecast.status == CF_ACTIVE) {
+            ++starts;
+            assert(fresh && managed.forecast.signal_bar == w.bar[0].time);
+            assert(managed.forecast.bars == 0 && managed.advice == CF_NEW);
+        }
+    }
+    assert(starts > 100 && ends > 100 && starts - ends <= 1);
+}
+
 int main() {
+    closed_history_checks();
+    stream_smoke_test();
     stalled_management();
     for (int direction : {1, -1}) {
         breakout_experiments(direction);
@@ -494,5 +589,5 @@ int main() {
     set(w,0,102,102.5,101.9,102.2);
     both(w, CF_CONTINUATION, CF_WAIT, 1);
 
-    std::cout << "Candle logic: five categories, mirrored directions, qualification, forecast windows, outcomes, side-by-side experiments, managed advice, and contextual planning passed.\n";
+    std::cout << "Candle logic: five categories, mirrored directions, qualification, forecast windows, outcomes, side-by-side experiments, managed advice, contextual planning, and history checks passed.\n";
 }

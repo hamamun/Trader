@@ -2,6 +2,9 @@
 #define CANDLE_FORECAST_LOGIC_MQH
 
 #define CF_HISTORY 24
+#define CF_CATCHUP 256
+
+enum CFHistoryState { CF_HISTORY_RETRY, CF_HISTORY_READY, CF_HISTORY_GAP };
 
 enum CFCategory { CF_NONE, CF_REVERSAL, CF_CONTINUATION, CF_BREAKOUT,
                   CF_FAILED_BREAKOUT, CF_RANGE_BOUNCE };
@@ -14,6 +17,31 @@ enum CFExperiment { CF_SWING_FILTER = 1, CF_REVERSAL_CONFIRM = 2, CF_EARLY_WARNI
 
 // Always newest closed candle first. No current (forming) candle is passed in.
 struct CFWindow { MqlRates bar[CF_HISTORY]; };
+
+// The current bar's timestamp is only a clock here; no forming OHLC is read.
+bool CFFreshClose(const datetime closed_open, const datetime current_open, const int seconds)
+{
+   return closed_open > 0 && seconds > 0 && current_open - closed_open == seconds;
+}
+
+bool CFValidBar(const MqlRates &value)
+{
+   return value.time > 0 && MathIsValidNumber(value.open) && MathIsValidNumber(value.high) &&
+          MathIsValidNumber(value.low) && MathIsValidNumber(value.close) &&
+          value.low <= MathMin(value.open, value.close) && MathMax(value.open, value.close) <= value.high;
+}
+
+CFHistoryState CFReplayState(const int copied, const int requested, const int anchor_index)
+{
+   if(copied < CF_HISTORY) return CF_HISTORY_RETRY;
+   if(anchor_index > 0 && anchor_index <= CF_CATCHUP)
+   {
+      // Oldest replayed bar has index anchor_index - 1 and needs CF_HISTORY bars.
+      if(copied >= anchor_index + CF_HISTORY - 1) return CF_HISTORY_READY;
+      return copied < requested ? CF_HISTORY_RETRY : CF_HISTORY_GAP;
+   }
+   return copied < requested ? CF_HISTORY_RETRY : CF_HISTORY_GAP;
+}
 
 struct CFReading
 {
@@ -574,7 +602,7 @@ void CFManageOnBar(CFManaged &m, const CFWindow &w, const CFReading &reading,
    if(m.forecast.status != CF_ACTIVE)
    {
       m.advice = CF_STANDBY;
-      m.explanation = "Waiting for a new setup";
+      m.explanation = allow_start && reading.decision == CF_WAIT ? reading.qualifier : "Waiting for a new setup";
       if(!allow_start || reading.decision != CF_SETUP) return;
       CFStart(m.forecast, reading, w.bar[0].time);
       m.warning_bars = m.quiet_bars = 0;
