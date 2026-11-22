@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.41"
+#property version   "1.42"
 #property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
 
 #include "CandleLogic.mqh"
@@ -33,42 +33,76 @@ struct CFStream
 
 CFStream streams[2];
 double chart_tick_size;
-int csv = INVALID_HANDLE;
-bool log_error = false;
+int csv[2] = {INVALID_HANDLE, INVALID_HANDLE};
+bool log_error[2] = {false, false};
 bool show_panel = false;
 datetime higher_cache_bar = 0;
 CFMarket higher_cache_market = CF_MARKET_UNKNOWN;
 
 string FrameName(const ENUM_TIMEFRAMES period) { return period == PERIOD_M5 ? "M5" : "M15"; }
+int CsvIndex(const ENUM_TIMEFRAMES period) { return period == PERIOD_M5 ? 0 : 1; }
 string Price(const double value) { return DoubleToString(value, _Digits); }
 string Stamp(const datetime value) { return TimeToString(value, TIME_DATE | TIME_SECONDS); }
 
-void LogFailed()
+string SafeSymbol(const string symbol)
 {
-   if(log_error) return;
-   Print("Candle Forecast: CSV logging failed (error ", GetLastError(), ").");
-   log_error = true;
-   if(csv != INVALID_HANDLE) FileClose(csv);
-   csv = INVALID_HANDLE;
+   string safe = symbol;
+   StringReplace(safe, "\\", "_");
+   StringReplace(safe, "/", "_");
+   StringReplace(safe, ":", "_");
+   StringReplace(safe, "*", "_");
+   StringReplace(safe, "?", "_");
+   StringReplace(safe, "\"", "_");
+   StringReplace(safe, "<", "_");
+   StringReplace(safe, ">", "_");
+   StringReplace(safe, "|", "_");
+   StringReplace(safe, " ", "_");
+   return safe;
 }
 
-void OpenLog()
+void LogFailed(const ENUM_TIMEFRAMES period)
+{
+   const int index = CsvIndex(period);
+   if(log_error[index]) return;
+   Print("Candle Forecast: CSV logging failed for ", FrameName(period), " (error ", GetLastError(), ").");
+   log_error[index] = true;
+   if(csv[index] != INVALID_HANDLE) FileClose(csv[index]);
+   csv[index] = INVALID_HANDLE;
+}
+
+void OpenLogFor(const ENUM_TIMEFRAMES period)
 {
    if(!SaveCsv) return;
-   const string path = "CandleForecast\\candles_" + IntegerToString(ChartID()) + "_" +
-                       IntegerToString((long)TimeLocal()) + "_" +
-                       IntegerToString((long)GetTickCount64()) + ".csv";
-   csv = FileOpen(path, FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_SHARE_READ, ',', CP_UTF8);
-   if(csv == INVALID_HANDLE)
+   const int index = CsvIndex(period);
+   if(csv[index] != INVALID_HANDLE || log_error[index]) return;
+   const string path = "CandleForecast\\" + SafeSymbol(_Symbol) + "_" + FrameName(period) + ".csv";
+   int handle = FileOpen(path, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_SHARE_READ, ',', CP_UTF8);
+   bool is_new = false;
+   if(handle == INVALID_HANDLE)
    {
-      LogFailed();
+      handle = FileOpen(path, FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_SHARE_READ, ',', CP_UTF8);
+      is_new = (handle != INVALID_HANDLE);
+   }
+   if(handle == INVALID_HANDLE)
+   {
+      LogFailed(period);
       return;
    }
-   if(FileWrite(csv, "event", "symbol", "timeframe", "bar_open_broker_time", "signal_bar_open_broker_time",
-                "category", "decision", "direction", "reason", "qualifier", "reference_close", "target",
-                "invalidation", "estimated_min_bars", "expiry_bars", "elapsed_bars", "status", "variant", "observed_close", "original_breakout_level", "advice", "management_reason", "local_market", "higher_market") == 0)
+   csv[index] = handle;
+   const long size = FileSize(handle);
+   if(is_new || size == 0)
    {
-      LogFailed();
+      if(FileWrite(handle, "event", "symbol", "timeframe", "bar_open_broker_time", "signal_bar_open_broker_time",
+                   "category", "decision", "direction", "reason", "qualifier", "reference_close", "target",
+                   "invalidation", "estimated_min_bars", "expiry_bars", "elapsed_bars", "status", "variant", "observed_close", "original_breakout_level", "advice", "management_reason", "local_market", "higher_market") == 0)
+      {
+         LogFailed(period);
+         return;
+      }
+   }
+   else if(FileSeek(handle, 0, SEEK_END) == -1)
+   {
+      LogFailed(period);
       return;
    }
    Print("Candle Forecast: CSV in MQL5/Files/", path, " (tester uses its agent's Files folder).");
@@ -79,9 +113,10 @@ void Log(const string event, const ENUM_TIMEFRAMES period, const CFReading &r, c
          const string advice = "", const string management_reason = "",
          const string local_market = "", const string higher_market = "")
 {
-   if(csv == INVALID_HANDLE) return;
+   const int index = CsvIndex(period);
+   if(csv[index] == INVALID_HANDLE) return;
    const bool setup = r.decision == CF_SETUP;
-   if(FileWrite(csv, event, _Symbol, FrameName(period), Stamp(bar_time),
+   if(FileWrite(csv[index], event, _Symbol, FrameName(period), Stamp(bar_time),
                 signal_time > 0 ? Stamp(signal_time) : "", CFCategoryName(r.category), CFDecisionName(r),
                 r.direction > 0 ? "Up" : (r.direction < 0 ? "Down" : ""), r.reason, r.qualifier,
                 Price(r.entry), setup ? Price(r.target) : "", setup ? Price(r.invalidation) : "",
@@ -91,10 +126,10 @@ void Log(const string event, const ENUM_TIMEFRAMES period, const CFReading &r, c
                 r.category == CF_BREAKOUT && (setup || r.decision == CF_WAIT) ?
                 Price(r.breakout_level) : "", advice, management_reason, local_market, higher_market) == 0)
    {
-      LogFailed();
+      LogFailed(period);
       return;
    }
-   FileFlush(csv);
+   FileFlush(csv[index]);
 }
 
 void EndForecast(CFStream &s, const datetime event_bar, const string observed_close = "")
@@ -139,7 +174,7 @@ void LogTrial(const string event, const ENUM_TIMEFRAMES period, const CFForecast
 void CompareClosed(CFTrial &trial, const CFWindow &w, const CFReading &baseline,
                    const ENUM_TIMEFRAMES period, const string event, const bool allow_start, const int index)
 {
-   if(csv == INVALID_HANDLE || (index == 0 ? !CompareSwings : !CompareVariants)) return;
+   if(csv[CsvIndex(period)] == INVALID_HANDLE || (index == 0 ? !CompareSwings : !CompareVariants)) return;
    const int flags = TrialFlags(index);
    const string observed_close = Price(w.bar[0].close);
    if(trial.forecast.status == CF_ACTIVE)
@@ -509,10 +544,12 @@ int OnInit()
    if(chart_tick_size <= 0) return INIT_FAILED;
    ResetStream(streams[0], PERIOD_M5, ReadM5);
    ResetStream(streams[1], PERIOD_M15, ReadM15);
-   log_error = false;
+   log_error[0] = false;
+   log_error[1] = false;
    higher_cache_bar = 0;
    higher_cache_market = CF_MARKET_UNKNOWN;
-   OpenLog();
+   if(ReadM5) OpenLogFor(PERIOD_M5);
+   if(ReadM15) OpenLogFor(PERIOD_M15);
    // Nonvisual tests use ticks only and do not need chart objects.
    show_panel = !MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_VISUAL_MODE);
    if(show_panel)
@@ -547,8 +584,11 @@ void OnDeinit(const int reason)
          if(streams[i].trials[lane].forecast.status == CF_ACTIVE)
             LogTrial("session_end", streams[i].period, streams[i].trials[lane].forecast, lane, streams[i].last_bar);
    }
-   if(csv != INVALID_HANDLE) FileClose(csv);
-   csv = INVALID_HANDLE;
+   for(int i = 0; i < 2; ++i)
+   {
+      if(csv[i] != INVALID_HANDLE) FileClose(csv[i]);
+      csv[i] = INVALID_HANDLE;
+   }
    if(show_panel)
    {
       ObjectsDeleteAll(0, CF_OBJECTS);
