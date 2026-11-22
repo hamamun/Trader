@@ -89,7 +89,7 @@ void OpenLogFor(const ENUM_TIMEFRAMES period)
       return;
    }
    csv[index] = handle;
-   const long size = FileSize(handle);
+   const ulong size = FileSize(handle);
    if(is_new || size == 0)
    {
       if(FileWrite(handle, "event", "symbol", "timeframe", "bar_open_broker_time", "signal_bar_open_broker_time",
@@ -100,7 +100,7 @@ void OpenLogFor(const ENUM_TIMEFRAMES period)
          return;
       }
    }
-   else if(FileSeek(handle, 0, SEEK_END) == -1)
+   else if(!FileSeek(handle, 0, SEEK_END))
    {
       LogFailed(period);
       return;
@@ -508,7 +508,7 @@ void Draw()
 {
    Background();
    Label("title", "Trader  /  " + _Symbol, 23, 30, clrWhite, 12);
-   Label("mode", "Monitor only - orders off  |  " + (SaveCsv ? (log_error ? "CSV unavailable" : "CSV logging on") : "CSV logging off"),
+   Label("mode", "Monitor only - orders off  |  " + (SaveCsv ? ((log_error[0] || log_error[1]) ? "CSV unavailable" : "CSV logging on") : "CSV logging off"),
          23, 53, C'164,179,198');
    DrawStream(streams[0], 77);
    DrawStream(streams[1], 239);
