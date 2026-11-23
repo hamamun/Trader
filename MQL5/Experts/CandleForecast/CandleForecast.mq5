@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.44"
+#property version   "1.45"
 #property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
 
 #include "CandleLogic.mqh"
@@ -86,17 +86,24 @@ bool SessionsDefined()
    return false;
 }
 
-bool InTradeSession(const datetime now)
+int DayOfWeek(const datetime when)
+{
+   MqlDateTime mdt;
+   if(!TimeToStruct(when, mdt)) return 0;
+   return (int)mdt.day_of_week; // 0 = Sunday ... 6 = Saturday
+}
+
+bool InTradeSession(const datetime when)
 {
    datetime from, to;
-   const int today = TimeDayOfWeek(now);
-   const long second = now % 86400;
+   const int today = DayOfWeek(when);
+   const long second = ((long)when) % 86400;
    for(uint i = 0; i < 16; ++i)
    {
       if(!SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)today, i, from, to)) break;
-      const long f = (long)(from % 86400);
+      const long f = ((long)from) % 86400;
       // 24:00 comes back as exactly 86400 seconds.
-      const long t = (to == (datetime)86400) ? 86400 : (long)(to % 86400);
+      const long t = (to == (datetime)86400) ? 86400 : ((long)to) % 86400;
       if(f <= t)
       {
          if(second >= f && second < t) return true;
@@ -106,11 +113,11 @@ bool InTradeSession(const datetime now)
    return false;
 }
 
-datetime NextSessionOpen(const datetime now)
+datetime NextSessionOpen(const datetime when)
 {
-   const long second = now % 86400;
-   const datetime midnight = now - second;
-   const int today = TimeDayOfWeek(now);
+   const long second = ((long)when) % 86400;
+   const datetime midnight = (datetime)((long)when - second);
+   const int today = DayOfWeek(when);
    for(int offset = 0; offset < 10; ++offset)
    {
       const int day = (today + offset) % 7;
@@ -118,8 +125,8 @@ datetime NextSessionOpen(const datetime now)
       for(uint i = 0; i < 16; ++i)
       {
          if(!SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)day, i, from, to)) break;
-         const datetime open_at = midnight + (long)offset * 86400 + (from % 86400);
-         if(open_at > now) return open_at;
+         const datetime open_at = (datetime)((long)midnight + (long)offset * 86400 + ((long)from) % 86400);
+         if(open_at > when) return open_at;
       }
    }
    return 0;
@@ -130,9 +137,9 @@ void UpdateMarketStatus()
    const color green = C'80,200,120';
    const color orange = C'247,183,117';
    const color red = C'248,136,136';
-   datetime now = TimeTradeServer();
-   if(now == 0) now = TimeCurrent();
-   if(now == 0) now = TimeLocal();
+   datetime when = TimeTradeServer();
+   if(when == 0) when = TimeCurrent();
+   if(when == 0) when = TimeLocal();
 
    const long trade_mode = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
    if(trade_mode == SYMBOL_TRADE_MODE_DISABLED)
@@ -145,9 +152,9 @@ void UpdateMarketStatus()
       { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Short-only mode"; g_market_color = orange; return; }
    if(!SessionsDefined())
       { g_market_status = CM_OPEN; g_market_text = "Market open | 24/7"; g_market_color = green; return; }
-   if(InTradeSession(now))
+   if(InTradeSession(when))
       { g_market_status = CM_OPEN; g_market_text = "Market open"; g_market_color = green; return; }
-   const datetime opens = NextSessionOpen(now);
+   const datetime opens = NextSessionOpen(when);
    g_market_status = CM_CLOSED;
    g_market_text = opens > 0 ? "Market closed | Opens " + Stamp(opens) + " server time"
                               : "Market closed | Open time unknown";
