@@ -176,6 +176,22 @@ bool CFRejects(const MqlRates &b, const int direction, const double typical)
    return span >= 0.60 * typical && wick >= 0.45 * span && finish <= 0.40 * span;
 }
 
+// Candle health in [0,1] for the setup candle, in the trade direction: half from
+// the body-to-span ratio (decisiveness) and half from close position inside the
+// range (conviction at the extreme). A full CFImpulse adds a bonus, capped at 1.
+// Host-tested; used purely for lot sizing, never to widen entries or exits.
+double CFCandleHealth(const MqlRates &b, const int direction, const double typical)
+{
+   const double span = b.high - b.low;
+   if(span <= 0.0 || direction == 0) return 0.0;
+   const double body = MathAbs(b.close - b.open);
+   const double body_ratio = MathMin(1.0, body / span);
+   const double close_pos = direction > 0 ? (b.close - b.low) / span : (b.high - b.close) / span;
+   double health = 0.5 * body_ratio + 0.5 * MathMax(0.0, MathMin(1.0, close_pos));
+   if(typical > 0.0 && CFImpulse(b, direction, typical)) health = MathMin(1.0, health + 0.25);
+   return health;
+}
+
 // Older local highs/lows provide the first visible obstacle, not a guaranteed target.
 double CFNearestSwing(const CFWindow &w, const int direction, const double entry,
                       const double epsilon)

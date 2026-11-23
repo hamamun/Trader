@@ -23,7 +23,7 @@ Trader draws a custom dashboard card (760px wide, roughly 300–510px tall depen
 | `CompareVariants` | On | Log the other experiments and the combined version; requires `SaveCsv` |
 | `AutoTrading` | On | Place real orders on qualified setups; false = monitor only |
 | `UseStopLoss` | On | Attach the invalidation level as the stop loss |
-| `TradeLots` | 0.01 | Fixed trade size per order (no risk-based sizing) |
+| `UseCalculatedLots` | true | Calculated lot size: `true` = candle-health-based sizing (1×–3× the symbol minimum, step-rounded), `false` = always the symbol minimum lot |
 | `PendingBars` | 3 | Candles a pending stop order waits before auto-cancelling |
 | `Magic` | 20261123 | Magic number for Trader orders |
 | `MaxSlippage` | 100 | Max slippage in points for market orders |
@@ -42,7 +42,7 @@ An order is placed only when **all** of these hold, evaluated on a freshly close
 - **Breakouts that closed decisively** beyond the level (a strong-close candle at least 0.25 x typical range past it) → **market order immediately**.
 - **Breakouts that only just crept past the level** → a **pending stop order** just beyond the signal candle's high/low (small buffer). If price genuinely continues, it fills; if it fakes out and falls back, nothing trades. The pending order lives for `PendingBars` candles, then cancels; it also cancels early if price closes back through the broken level (idea dead).
 
-- **Stop loss** at the invalidation level (unless `UseStopLoss=false` or the broker's minimum stop distance forbids it — then the order goes without a stop and says so in the journal). **Take profit** at the forecast target (same broker-minimum rule). There is no risk-based sizing — `TradeLots` is fixed and you accepted that.
+- **Stop loss** at the invalidation level (unless `UseStopLoss=false` or the broker's minimum stop distance forbids it — then the order goes without a stop and says so in the journal). **Take profit** at the forecast target (same broker-minimum rule). There is no account-risk percentage sizing. With `UseCalculatedLots=true` the trade size is the symbol minimum lot scaled by the health of the setup candle (0.5·body-to-range + 0.5·close-position-in-range, plus an impulse bonus), floored to the symbol volume step — always between 1× and 3× the symbol minimum, never above the symbol maximum, so a broker cannot reject the order for an invalid volume. With `UseCalculatedLots=false` the order always uses the exact symbol minimum lot. If your broker rejected a fixed 0.01, this is the fix — the failure mode it guards against is roughly `Invalid volume` (retcode 10014/10013).
 - **Exits are wired** for Trader positions only: invalidation, target, managed early-exit and expiry/forecast-over (see above). The advice line itself still never moves levels — it exits positions, it does not adjust stops/targets.
 - Orders never fire in the Strategy Tester. Pending orders survive restarts (recovered on init by magic+comment tag; the dead-level cancel is in-memory only, the lifetime cancel always applies). If a pending vanishes, Trader checks whether a Trader position appeared and logs the real fill price — otherwise it logs the order as gone (filled or cancelled externally).
 

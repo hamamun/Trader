@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.54"
+#property version   "1.55"
 #property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
 #include <Trade/Trade.mqh>
@@ -14,7 +14,7 @@ input bool CompareSwings   = true;  // Log the standalone confirmed-swing compar
 input bool CompareVariants = true;  // Log the other experiments and all upgrades together
 input bool   AutoTrading  = true;   // Send real orders when a setup qualifies (false = monitor only)
 input bool   UseStopLoss  = true;   // Attach the invalidation level as stop loss
-input double TradeLots    = 0.01;    // Fixed trade size per order (no risk-based sizing)
+input bool   UseCalculatedLots = true; // Calculated lot size (true = candle-health sized, false = symbol minimum lot)
 input int    PendingBars  = 3;       // Candles a pending stop order waits before auto-cancelling
 input long   Magic        = 20261123;// Magic number for Trader orders
 input int    MaxSlippage  = 100;     // Max slippage in points for market orders
@@ -342,19 +342,40 @@ bool AutoHasPending(const CFStream &s)
    return false;
 }
 
+// Symbol-safe lot sizing. Never returns less than the symbol minimum, so a broker
+// cannot reject the order for volume; rounds DOWN to SYMBOL_VOLUME_STEP so it can
+// never exceed the intended size. When UseCalculatedLots is off it returns the
+// symbol minimum exactly. Otherwise scales 1x..3x of the minimum by candle health.
+double AutoLotSize(const MqlRates &b, const int direction, const double typical)
+{
+   const double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   const double step    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   const double safe_min  = min_lot > 0.0 ? min_lot : 0.01;
+   const double safe_max  = max_lot > 0.0 ? MathMax(max_lot, safe_min) : safe_min;
+   const double safe_step = step > 0.0 ? step : safe_min;
+   if(!UseCalculatedLots) return NormalizeDouble(safe_min, 8);
+   const double health = CFCandleHealth(b, direction, typical);
+   double lots = safe_min * (1.0 + 2.0 * health);   // 1x..3x symbol minimum by candle health
+   lots = MathFloor(lots / safe_step + 1e-9) * safe_step;
+   lots = MathMin(MathMax(lots, safe_min), safe_max);
+   return NormalizeDouble(lots, 8);
+}
+
 // Record every order action in the per-stream CSV (event = order / order_cancel /
 // order_fail / order_fill). Variant carries the mode; management_reason carries
-// ticket/lots/sl/tp/price; no commas inside fields.
+// ticket/lots/sl/tp/price; no commas inside fields. lots < 0 means "not applicable".
 void LogAuto(const string event, const CFStream &s, const double price, const double sl, const double tp,
-             const ulong ticket, const string note)
+             const ulong ticket, const string note, const double lots = -1.0)
 {
    const int index = CsvIndex(s.period);
    if(csv[index] == INVALID_HANDLE) return;
-   string details = "lots=" + DoubleToString(TradeLots, 2);
-   if(ticket != 0) details += ";ticket=" + IntegerToString((long)ticket);
-   if(price > 0.0) details += ";price=" + Price(price);
-   details += sl > 0.0 ? ";sl=" + Price(sl) : ";sl=off";
-   details += tp > 0.0 ? ";tp=" + Price(tp) : ";tp=off";
+   string details = "";
+   if(lots >= 0.0) details = "lots=" + DoubleToString(lots, 8);
+   if(ticket != 0) details += (details == "" ? "" : ";") + "ticket=" + IntegerToString((long)ticket);
+   if(price > 0.0) details += (details == "" ? "" : ";") + "price=" + Price(price);
+   details += (details == "" ? "" : ";") + (sl > 0.0 ? "sl=" + Price(sl) : "sl=off");
+   details += (details == "" ? "" : ";") + (tp > 0.0 ? "tp=" + Price(tp) : "tp=off");
    if(note != "") details += ";" + note;
    StringReplace(details, ",", ";"); // keep the CSV single-column safe
    if(s.auto_signal.category != CF_NONE && s.auto_signal.decision == CF_SETUP)
@@ -430,6 +451,7 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
    const int direction = r.direction;
    const double typical = CFTypicalRange(w, 1);
    const bool strong = CFImpulse(b, direction, typical);
+   const double lots = AutoLotSize(b, direction, typical);
    const int mode = CFEntryMode(r.category, direction, b.close, r.breakout_level, typical, strong);
    const string tag = StringFormat("Trader %s %s", FrameName(s.period), mode == CF_ENTRY_MARKET ? "MKT" : "STP");
    const double current = direction > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
@@ -441,8 +463,8 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
    if(mode == CF_ENTRY_MARKET)
    {
       AutoStopsAndTarget(direction, current, r.invalidation, r.target, sl, tp);
-      ok = direction > 0 ? auto_trade.Buy(TradeLots, _Symbol, 0.0, sl, tp, tag)
-                         : auto_trade.Sell(TradeLots, _Symbol, 0.0, sl, tp, tag);
+      ok = direction > 0 ? auto_trade.Buy(lots, _Symbol, 0.0, sl, tp, tag)
+                         : auto_trade.Sell(lots, _Symbol, 0.0, sl, tp, tag);
    }
    else
    {
@@ -456,8 +478,8 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
          return;
       }
       AutoStopsAndTarget(direction, price, r.invalidation, r.target, sl, tp);
-      ok = direction > 0 ? auto_trade.BuyStop(TradeLots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag)
-                         : auto_trade.SellStop(TradeLots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag);
+      ok = direction > 0 ? auto_trade.BuyStop(lots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag)
+                         : auto_trade.SellStop(lots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag);
       if(ok)
       {
          s.auto_ticket = auto_trade.ResultOrder();
@@ -471,12 +493,12 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
    {
       const double fill = auto_trade.ResultPrice() > 0.0 ? auto_trade.ResultPrice() : placed_price;
       Print("Trader: ", mode == CF_ENTRY_MARKET ? "market" : "pending", " order placed (", tag, ") ",
-            direction > 0 ? "BUY" : "SELL", " ", DoubleToString(TradeLots, 2),
+            direction > 0 ? "BUY" : "SELL", " ", DoubleToString(lots, 8),
             " SL ", sl > 0 ? Price(sl) : "off", " TP ", tp > 0 ? Price(tp) : "off");
       if(mode == CF_ENTRY_MARKET)
-         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=market;filled=" + Price(fill));
+         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=market;filled=" + Price(fill), lots);
       else
-         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=pending;pending_price=" + Price(fill));
+         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=pending;pending_price=" + Price(fill), lots);
    }
    else
    {
