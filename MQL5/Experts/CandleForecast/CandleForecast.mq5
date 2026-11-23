@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.46"
+#property version   "1.47"
 #property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
 
 #include "CandleLogic.mqh"
@@ -173,6 +173,19 @@ string GvPrefix(const ENUM_TIMEFRAMES period)
    return "Trader." + SafeSymbol(_Symbol) + "." + FrameName(period) + ".";
 }
 
+string StatePath(const ENUM_TIMEFRAMES period)
+{
+   return "CandleForecast\\state_" + SafeSymbol(_Symbol) + "_" + FrameName(period) + ".dat";
+}
+
+string ActiveSummary()
+{
+   string summary = "";
+   if(streams[0].managed.forecast.status == CF_ACTIVE) summary += "  |  M5 forecast active";
+   if(streams[1].managed.forecast.status == CF_ACTIVE) summary += "  |  M15 forecast active";
+   return summary;
+}
+
 void GvSet(const string &prefix, const string key, const double value)
 {
    if(!GlobalVariableSet(prefix + key, value)) Print("Trader: could not save state '", key, "'");
@@ -294,6 +307,90 @@ void LoadTrial(const string &prefix, const string tag, CFTrial &t)
    }
 }
 
+void WriteForecastFile(const int handle, const CFForecast &f)
+{
+   FileWriteDouble(handle, (double)f.status);
+   FileWriteDouble(handle, (double)f.signal_bar);
+   FileWriteDouble(handle, (double)f.last_checked_bar);
+   FileWriteDouble(handle, (double)f.bars);
+   FileWriteDouble(handle, (double)f.setup.category);
+   FileWriteDouble(handle, (double)f.setup.direction);
+   FileWriteDouble(handle, f.setup.entry);
+   FileWriteDouble(handle, f.setup.target);
+   FileWriteDouble(handle, f.setup.invalidation);
+   FileWriteDouble(handle, f.setup.breakout_level);
+   FileWriteDouble(handle, (double)f.setup.min_bars);
+   FileWriteDouble(handle, (double)f.setup.max_bars);
+}
+
+void WriteTrialFile(const int handle, const CFTrial &t)
+{
+   WriteForecastFile(handle, t.forecast);
+   FileWriteDouble(handle, (double)t.pending.category);
+   FileWriteDouble(handle, (double)t.pending.decision);
+   FileWriteDouble(handle, (double)t.pending.direction);
+   FileWriteDouble(handle, t.pending.entry);
+   FileWriteDouble(handle, t.pending.target);
+   FileWriteDouble(handle, t.pending.invalidation);
+   FileWriteDouble(handle, t.pending.breakout_level);
+   FileWriteDouble(handle, (double)t.pending.min_bars);
+   FileWriteDouble(handle, (double)t.pending.max_bars);
+   FileWriteDouble(handle, t.pending_level);
+   FileWriteDouble(handle, (double)t.pending_bars);
+}
+
+bool ReadForecastFile(const int handle, CFForecast &f)
+{
+   CFForecast g = {};
+   double v;
+   if(!FileReadDouble(handle, v)) return false; g.status = (CFStatus)(int)v;
+   if(!FileReadDouble(handle, v)) return false; g.signal_bar = (datetime)v;
+   if(!FileReadDouble(handle, v)) return false; g.last_checked_bar = (datetime)v;
+   if(!FileReadDouble(handle, v)) return false; g.bars = (int)v;
+   if(!FileReadDouble(handle, v)) return false; g.setup.category = (CFCategory)(int)v;
+   if(!FileReadDouble(handle, v)) return false; g.setup.direction = (int)v;
+   if(!FileReadDouble(handle, v)) return false; g.setup.entry = v;
+   if(!FileReadDouble(handle, v)) return false; g.setup.target = v;
+   if(!FileReadDouble(handle, v)) return false; g.setup.invalidation = v;
+   if(!FileReadDouble(handle, v)) return false; g.setup.breakout_level = v;
+   if(!FileReadDouble(handle, v)) return false; g.setup.min_bars = (int)v;
+   if(!FileReadDouble(handle, v)) return false; g.setup.max_bars = (int)v;
+   if(!ForecastValid(g)) { f.status = CF_IDLE; return true; }
+   f = g;
+   return true;
+}
+
+bool ReadTrialFile(const int handle, CFTrial &t)
+{
+   if(!ReadForecastFile(handle, t.forecast)) return false;
+   CFReading g = {};
+   double v;
+   if(!FileReadDouble(handle, v)) return false; g.category = (CFCategory)(int)v;
+   if(!FileReadDouble(handle, v)) return false; g.decision = (CFDecision)(int)v;
+   if(!FileReadDouble(handle, v)) return false; g.direction = (int)v;
+   if(!FileReadDouble(handle, v)) return false; g.entry = v;
+   if(!FileReadDouble(handle, v)) return false; g.target = v;
+   if(!FileReadDouble(handle, v)) return false; g.invalidation = v;
+   if(!FileReadDouble(handle, v)) return false; g.breakout_level = v;
+   if(!FileReadDouble(handle, v)) return false; g.min_bars = (int)v;
+   if(!FileReadDouble(handle, v)) return false; g.max_bars = (int)v;
+   if(!FileReadDouble(handle, v)) return false; t.pending_level = v;
+   if(!FileReadDouble(handle, v)) return false; t.pending_bars = (int)v;
+   const bool valid = (g.category >= CF_NONE && g.category <= CF_RANGE_BOUNCE &&
+                       g.decision >= CF_SKIP && g.decision <= CF_SETUP &&
+                       (g.direction == -1 || g.direction == 0 || g.direction == 1));
+   if(!valid || t.pending_bars <= 0)
+   {
+      CFReading empty = {};
+      t.pending = empty;
+      t.pending_level = 0;
+      t.pending_bars = 0;
+      return true;
+   }
+   t.pending = g;
+   return true;
+}
+
 void SaveStreamState(CFStream &s)
 {
    if(MQL_TESTER) return;
@@ -313,6 +410,26 @@ void SaveStreamState(CFStream &s)
    GvSet(prefix, "mgmt.progress", s.managed.best_progress);
    SaveTrial(prefix, "plan.", s.planner);
    for(int i = 0; i < CF_TRIAL_COUNT; ++i) SaveTrial(prefix, "t" + IntegerToString(i) + ".", s.trials[i]);
+   // Independent mirror: a tiny positional file, if the terminal's global variables misbehave.
+   const string path = StatePath(s.period);
+   int handle = FileOpen(path, FILE_WRITE | FILE_BINARY | FILE_SHARE_READ);
+   if(handle == INVALID_HANDLE) return;
+   FileWriteDouble(handle, 20261123.0); // format marker
+   FileWriteDouble(handle, 1.0);        // version
+   FileWriteDouble(handle, (double)s.last_bar);
+   FileWriteDouble(handle, s.waiting_for_new_close ? 1.0 : 0.0);
+   FileWriteDouble(handle, (double)s.last_outcome_code);
+   FileWriteDouble(handle, s.last_outcome_close);
+   WriteForecastFile(handle, s.forecast);
+   WriteForecastFile(handle, s.managed.forecast);
+   FileWriteDouble(handle, s.managed.warning_adverse);
+   FileWriteDouble(handle, s.managed.warning_favorable);
+   FileWriteDouble(handle, (double)s.managed.warning_bars);
+   FileWriteDouble(handle, (double)s.managed.quiet_bars);
+   FileWriteDouble(handle, s.managed.best_progress);
+   WriteTrialFile(handle, s.planner);
+   for(int i = 0; i < CF_TRIAL_COUNT; ++i) WriteTrialFile(handle, s.trials[i]);
+   FileClose(handle);
 }
 
 void SaveStateAll()
@@ -323,12 +440,8 @@ void SaveStateAll()
    GlobalVariablesFlush();
 }
 
-bool LoadStreamState(CFStream &s)
+bool LoadStreamStateGlobals(CFStream &s, const string &prefix)
 {
-   if(MQL_TESTER) return false;
-   if(!s.enabled) return false;
-   const string prefix = GvPrefix(s.period);
-   if(GvGet(prefix, "ver", -1.0) != 1.0) return false;
    s.last_bar = (datetime)GvGet(prefix, "last_bar", 0);
    s.waiting_for_new_close = GvGet(prefix, "waiting", 1.0) != 0;
    s.last_outcome_code = (CFStatus)(int)GvGet(prefix, "oc_code", 0.0);
@@ -347,6 +460,53 @@ bool LoadStreamState(CFStream &s)
    LoadTrial(prefix, "plan.", s.planner);
    for(int i = 0; i < CF_TRIAL_COUNT; ++i) LoadTrial(prefix, "t" + IntegerToString(i) + ".", s.trials[i]);
    return true;
+}
+
+bool LoadStreamStateFile(CFStream &s)
+{
+   const string path = StatePath(s.period);
+   const int handle = FileOpen(path, FILE_READ | FILE_BINARY | FILE_SHARE_READ);
+   if(handle == INVALID_HANDLE) return false;
+   double marker, version, v;
+   if(!FileReadDouble(handle, marker) || !FileReadDouble(handle, version)) { FileClose(handle); return false; }
+   if(marker != 20261123.0 || version != 1.0) { FileClose(handle); return false; }
+   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   s.last_bar = (datetime)v;
+   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   s.waiting_for_new_close = v != 0;
+   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   s.last_outcome_code = (CFStatus)(int)v;
+   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   s.last_outcome_close = v;
+   s.last_outcome = OutcomeText(s.last_outcome_code, s.last_outcome_close);
+   if(!ReadForecastFile(handle, s.forecast)) { FileClose(handle); return false; }
+   if(!ReadForecastFile(handle, s.managed.forecast)) { FileClose(handle); return false; }
+   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   s.managed.warning_adverse = v;
+   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   s.managed.warning_favorable = v;
+   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   s.managed.warning_bars = (int)v;
+   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   s.managed.quiet_bars = (int)v;
+   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   s.managed.best_progress = v;
+   if(!ReadTrialFile(handle, s.planner)) { FileClose(handle); return false; }
+   for(int i = 0; i < CF_TRIAL_COUNT; ++i)
+      if(!ReadTrialFile(handle, s.trials[i])) { FileClose(handle); return false; }
+   FileClose(handle);
+   s.managed.advice = CF_STANDBY;
+   s.managed.explanation = "Restored after session restart; decide on the next close";
+   return true;
+}
+
+bool LoadStreamState(CFStream &s)
+{
+   if(MQL_TESTER) return false;
+   if(!s.enabled) return false;
+   const string prefix = GvPrefix(s.period);
+   if(GvGet(prefix, "ver", -1.0) == 1.0) return LoadStreamStateGlobals(s, prefix);
+   return LoadStreamStateFile(s);
 }
 
 void RestoreStateAll()
@@ -867,7 +1027,7 @@ void Draw()
    UpdateMarketStatus();
    if(g_market_status == CM_CLOSED || g_market_status == CM_WITHHELD)
    {
-      DrawOnlyLine(g_market_text, g_market_color);
+      DrawOnlyLine(g_market_text + ActiveSummary(), g_market_color);
       return;
    }
    DeleteOnlyLine();
@@ -952,7 +1112,7 @@ void Refresh()
          g_market_was_closed = true;
          Print("Candle Forecast: market closed; monitoring paused.");
       }
-      if(show_panel) DrawOnlyLine(g_market_text, g_market_color);
+      if(show_panel) DrawOnlyLine(g_market_text + ActiveSummary(), g_market_color);
       return;
    }
    if(g_market_was_closed)
@@ -963,7 +1123,11 @@ void Refresh()
    const bool m5_changed = UpdateStream(streams[0]);
    const bool m15_changed = UpdateStream(streams[1]);
    if(m5_changed || m15_changed) SaveStateAll();
-   if(show_panel && (m5_changed || m15_changed || g_market_text != g_drawn_status)) Draw();
+   // Panel self-heal: if MT5 destroyed the chart objects (timeframe switch), rebuild them.
+   if(show_panel && (ObjectFind(0, CF_OBJECTS + "panel") < 0 ||
+                     ObjectFind(0, CF_OBJECTS + "M5title") < 0 ||
+                     ObjectFind(0, CF_OBJECTS + "M15title") < 0)) Draw();
+   else if(show_panel && (m5_changed || m15_changed || g_market_text != g_drawn_status)) Draw();
 }
 
 void OnTick()  { Refresh(); }
