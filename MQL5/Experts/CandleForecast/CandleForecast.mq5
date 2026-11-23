@@ -1130,11 +1130,17 @@ void Refresh()
    const bool m5_changed = UpdateStream(streams[0]);
    const bool m15_changed = UpdateStream(streams[1]);
    if(m5_changed || m15_changed) SaveStateAll();
-   // Panel self-heal: if MT5 destroyed the chart objects (timeframe switch), rebuild them.
-   if(show_panel && (ObjectFind(0, CF_OBJECTS + "panel") < 0 ||
-                     ObjectFind(0, CF_OBJECTS + "M5title") < 0 ||
-                     ObjectFind(0, CF_OBJECTS + "M15title") < 0)) Draw();
-   else if(show_panel && (m5_changed || m15_changed || g_market_text != g_drawn_status)) Draw();
+   if(show_panel)
+   {
+      // Panel self-heal: if MT5 destroyed the chart objects (timeframe switch), rebuild them.
+      const bool line_mode = (g_market_status == CM_WITHHELD);
+      const bool missing = line_mode
+         ? ObjectFind(0, CF_OBJECTS + "statusline") < 0
+         : (ObjectFind(0, CF_OBJECTS + "panel") < 0 ||
+            ObjectFind(0, CF_OBJECTS + "M5title") < 0 ||
+            ObjectFind(0, CF_OBJECTS + "M15title") < 0);
+      if(missing || m5_changed || m15_changed || g_market_text != g_drawn_status) Draw();
+   }
 }
 
 void OnTick()  { Refresh(); }
