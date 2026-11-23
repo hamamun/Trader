@@ -76,25 +76,33 @@ void both(const CFWindow &w, CFCategory category, CFDecision decision, int direc
 
 void lifecycle(CFReading r) {
     const bool up = r.direction > 0;
+    const double beyond = up ? r.invalidation - 2*tick : r.invalidation + 2*tick;
     const MqlRates both_touched = {110, r.entry, std::max(r.target, r.invalidation),
                                    std::min(r.target, r.invalidation), r.entry};
     MqlRates target_touched = {110, r.entry, up ? r.target : r.entry, up ? r.entry : r.target, r.entry};
     MqlRates stop_touched = {110, r.entry, up ? r.entry : r.invalidation, up ? r.invalidation : r.entry, r.entry};
+    MqlRates stop_closed = {120, r.entry, up ? r.entry : beyond, up ? beyond : r.entry, beyond};
+    const MqlRates ambiguous_closed = {110, r.entry, up ? r.target : beyond, up ? beyond : r.target, beyond};
     CFForecast f;
     CFStart(f, r, 110);
     CFAdvance(f, both_touched, tick);
     assert(f.status == CF_ACTIVE && f.bars == 0); // Signal bar never counts toward the outcome.
     CFStart(f, r, 100);
     CFAdvance(f, both_touched, tick);
-    assert(f.status == CF_AMBIGUOUS && f.bars == 1);
+    assert(f.status == CF_TARGET && f.bars == 1); // wick-invalidation alone no longer cancels the trade
+    CFStart(f, r, 100);
+    CFAdvance(f, ambiguous_closed, tick);
+    assert(f.status == CF_AMBIGUOUS && f.bars == 1); // target wicked + close beyond invalidation
     CFAdvance(f, target_touched, tick);
-    assert(f.status == CF_AMBIGUOUS && f.bars == 1);
+    assert(f.status == CF_AMBIGUOUS && f.bars == 1); // terminal outcome stays sticky
     CFStart(f, r, 100);
     CFAdvance(f, target_touched, tick);
     assert(f.status == CF_TARGET && f.bars == 1);
     CFStart(f, r, 100);
     CFAdvance(f, stop_touched, tick);
-    assert(f.status == CF_INVALIDATED && f.bars == 1);
+    assert(f.status == CF_ACTIVE && f.bars == 1);   // wick through invalidation: breathing room, trade stays on
+    CFAdvance(f, stop_closed, tick);
+    assert(f.status == CF_INVALIDATED && f.bars == 2); // close beyond invalidation ends the trade
     CFStart(f, r, 100);
     for (int i = 1; i <= r.max_bars; ++i) {
         CFAdvance(f, {100+10*i, r.entry, r.entry, r.entry, r.entry}, tick);
@@ -262,7 +270,12 @@ void structure_experiments(const int direction) {
     set(w,0,101,102,96,98.95);
     closed = direction > 0 ? w : reflect(w);
     CFAdvanceTrial(experiment, closed, tick, CF_EARLY_WARNING);
-    assert(experiment.status == CF_INVALIDATED); // Intrabar invalidation precedes a warning at the close.
+    assert(experiment.status == CF_STRUCTURE_EXIT); // Wick through invalidation: no invalidation; close-confirmed structure logic decides.
+    CFStart(experiment, signal, 9000);
+    set(w,0,101,102,96,96.9);
+    closed = direction > 0 ? w : reflect(w);
+    CFAdvanceTrial(experiment, closed, tick, CF_EARLY_WARNING);
+    assert(experiment.status == CF_INVALIDATED); // Close beyond the invalidation ends the trade.
 }
 
 void managed_forecast(const int direction) {
