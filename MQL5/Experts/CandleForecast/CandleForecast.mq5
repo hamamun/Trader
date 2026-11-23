@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.42"
+#property version   "1.44"
 #property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
 
 #include "CandleLogic.mqh"
@@ -29,6 +29,8 @@ struct CFStream
    CFReading plan;
    CFMarket local_market, higher_market;
    string last_outcome;
+   CFStatus last_outcome_code;
+   double last_outcome_close;
 };
 
 CFStream streams[2];
@@ -38,6 +40,14 @@ bool log_error[2] = {false, false};
 bool show_panel = false;
 datetime higher_cache_bar = 0;
 CFMarket higher_cache_market = CF_MARKET_UNKNOWN;
+
+enum CMMarketStatus { CM_OPEN, CM_WITHHELD, CM_CLOSED };
+CMMarketStatus g_market_status = CM_OPEN;
+string g_market_text = "";
+color g_market_color = C'80,200,120';
+bool g_market_was_closed = false;
+bool out_of_range = false;
+string g_drawn_status = "";
 
 string FrameName(const ENUM_TIMEFRAMES period) { return period == PERIOD_M5 ? "M5" : "M15"; }
 int CsvIndex(const ENUM_TIMEFRAMES period) { return period == PERIOD_M5 ? 0 : 1; }
@@ -58,6 +68,283 @@ string SafeSymbol(const string symbol)
    StringReplace(safe, "|", "_");
    StringReplace(safe, " ", "_");
    return safe;
+}
+
+// ----------------------------------------------------------------------
+// Market status: broker trade mode + trade session schedule are the
+// source of truth. If the symbol defines no trade sessions at all,
+// the market is treated as 24/7 (e.g. typical crypto CFDs).
+// ----------------------------------------------------------------------
+bool SessionsDefined()
+{
+   for(int day = 0; day < 7; ++day)
+   {
+      datetime from, to;
+      for(uint i = 0; i < 16; ++i)
+         if(SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)day, i, from, to)) return true;
+   }
+   return false;
+}
+
+bool InTradeSession(const datetime now)
+{
+   datetime from, to;
+   const int today = TimeDayOfWeek(now);
+   const long second = now % 86400;
+   for(uint i = 0; i < 16; ++i)
+   {
+      if(!SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)today, i, from, to)) break;
+      const long f = (long)(from % 86400);
+      // 24:00 comes back as exactly 86400 seconds.
+      const long t = (to == (datetime)86400) ? 86400 : (long)(to % 86400);
+      if(f <= t)
+      {
+         if(second >= f && second < t) return true;
+      }
+      else if(second >= f || second < t) return true; // Session wraps midnight.
+   }
+   return false;
+}
+
+datetime NextSessionOpen(const datetime now)
+{
+   const long second = now % 86400;
+   const datetime midnight = now - second;
+   const int today = TimeDayOfWeek(now);
+   for(int offset = 0; offset < 10; ++offset)
+   {
+      const int day = (today + offset) % 7;
+      datetime from, to;
+      for(uint i = 0; i < 16; ++i)
+      {
+         if(!SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)day, i, from, to)) break;
+         const datetime open_at = midnight + (long)offset * 86400 + (from % 86400);
+         if(open_at > now) return open_at;
+      }
+   }
+   return 0;
+}
+
+void UpdateMarketStatus()
+{
+   const color green = C'80,200,120';
+   const color orange = C'247,183,117';
+   const color red = C'248,136,136';
+   datetime now = TimeTradeServer();
+   if(now == 0) now = TimeCurrent();
+   if(now == 0) now = TimeLocal();
+
+   const long trade_mode = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+   if(trade_mode == SYMBOL_TRADE_MODE_DISABLED)
+      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Trade disabled by broker"; g_market_color = orange; return; }
+   if(trade_mode == SYMBOL_TRADE_MODE_CLOSEONLY)
+      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Close-only mode"; g_market_color = orange; return; }
+   if(trade_mode == SYMBOL_TRADE_MODE_LONGONLY)
+      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Long-only mode"; g_market_color = orange; return; }
+   if(trade_mode == SYMBOL_TRADE_MODE_SHORTONLY)
+      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Short-only mode"; g_market_color = orange; return; }
+   if(!SessionsDefined())
+      { g_market_status = CM_OPEN; g_market_text = "Market open | 24/7"; g_market_color = green; return; }
+   if(InTradeSession(now))
+      { g_market_status = CM_OPEN; g_market_text = "Market open"; g_market_color = green; return; }
+   const datetime opens = NextSessionOpen(now);
+   g_market_status = CM_CLOSED;
+   g_market_text = opens > 0 ? "Market closed | Opens " + Stamp(opens) + " server time"
+                              : "Market closed | Open time unknown";
+   g_market_color = red;
+}
+
+// ----------------------------------------------------------------------
+// Session memory via terminal global variables - the same mechanism the
+// terminal itself uses (they survive terminal restarts and keep values
+// while no chart changes reset the program's memory). The Strategy
+// Tester keeps a separate set, so persistence is disabled there and
+// every test starts from a clean state.
+// ----------------------------------------------------------------------
+string GvPrefix(const ENUM_TIMEFRAMES period)
+{
+   return "Trader." + SafeSymbol(_Symbol) + "." + FrameName(period) + ".";
+}
+
+void GvSet(const string &prefix, const string key, const double value)
+{
+   if(!GlobalVariableSet(prefix + key, value)) Print("Trader: could not save state '", key, "'");
+}
+
+double GvGet(const string &prefix, const string key, const double fallback)
+{
+   if(!GlobalVariableCheck(prefix + key)) return fallback;
+   return GlobalVariableGet(prefix + key);
+}
+
+string OutcomeText(const CFStatus code, const double close)
+{
+   if(code == CF_IDLE) return "";
+   string text = CFStatusName(code);
+   if((code == CF_STRUCTURE_EXIT || code == CF_BREAKOUT_EXIT || code == CF_CANDLE_EXIT) && close > 0)
+      text += " @ close " + Price(close);
+   return text;
+}
+
+bool ForecastValid(const CFForecast &f)
+{
+   if(f.status < CF_IDLE || f.status > CF_CANDLE_EXIT) return false;
+   if(f.status == CF_IDLE) return true;
+   if(f.signal_bar <= 0 || f.last_checked_bar < f.signal_bar) return false;
+   if(f.setup.direction != 1 && f.setup.direction != -1) return false;
+   if(f.setup.entry == 0.0 || f.setup.target == 0.0 || f.setup.invalidation == 0.0) return false;
+   return true;
+}
+
+void SaveForecast(const string &prefix, const string tag, const CFForecast &f)
+{
+   GvSet(prefix, tag + "status", (double)f.status);
+   GvSet(prefix, tag + "signal", (double)f.signal_bar);
+   GvSet(prefix, tag + "checked", (double)f.last_checked_bar);
+   GvSet(prefix, tag + "bars", (double)f.bars);
+   GvSet(prefix, tag + "cat", (double)f.setup.category);
+   GvSet(prefix, tag + "dir", (double)f.setup.direction);
+   GvSet(prefix, tag + "entry", f.setup.entry);
+   GvSet(prefix, tag + "target", f.setup.target);
+   GvSet(prefix, tag + "inval", f.setup.invalidation);
+   GvSet(prefix, tag + "brk", f.setup.breakout_level);
+   GvSet(prefix, tag + "minbars", (double)f.setup.min_bars);
+   GvSet(prefix, tag + "maxbars", (double)f.setup.max_bars);
+}
+
+void LoadForecast(const string &prefix, const string tag, CFForecast &f)
+{
+   CFForecast g = {};
+   g.status = (CFStatus)(int)GvGet(prefix, tag + "status", (double)CF_IDLE);
+   g.signal_bar = (datetime)GvGet(prefix, tag + "signal", 0);
+   g.last_checked_bar = (datetime)GvGet(prefix, tag + "checked", (double)g.signal_bar);
+   g.bars = (int)GvGet(prefix, tag + "bars", 0);
+   g.setup.category = (CFCategory)(int)GvGet(prefix, tag + "cat", 0);
+   g.setup.direction = (int)GvGet(prefix, tag + "dir", 0);
+   g.setup.entry = GvGet(prefix, tag + "entry", 0);
+   g.setup.target = GvGet(prefix, tag + "target", 0);
+   g.setup.invalidation = GvGet(prefix, tag + "inval", 0);
+   g.setup.breakout_level = GvGet(prefix, tag + "brk", 0);
+   g.setup.min_bars = (int)GvGet(prefix, tag + "minbars", 0);
+   g.setup.max_bars = (int)GvGet(prefix, tag + "maxbars", 0);
+   if(!ForecastValid(g)) { f.status = CF_IDLE; return; }
+   f = g;
+}
+
+void SaveReading(const string &prefix, const string tag, const CFReading &r)
+{
+   GvSet(prefix, tag + "cat", (double)r.category);
+   GvSet(prefix, tag + "dec", (double)r.decision);
+   GvSet(prefix, tag + "dir", (double)r.direction);
+   GvSet(prefix, tag + "entry", r.entry);
+   GvSet(prefix, tag + "target", r.target);
+   GvSet(prefix, tag + "inval", r.invalidation);
+   GvSet(prefix, tag + "brk", r.breakout_level);
+   GvSet(prefix, tag + "minbars", (double)r.min_bars);
+   GvSet(prefix, tag + "maxbars", (double)r.max_bars);
+}
+
+void LoadReading(const string &prefix, const string tag, CFReading &r, bool &valid)
+{
+   CFReading g = {};
+   g.category = (CFCategory)(int)GvGet(prefix, tag + "cat", 0);
+   g.decision = (CFDecision)(int)GvGet(prefix, tag + "dec", 0);
+   g.direction = (int)GvGet(prefix, tag + "dir", 0);
+   g.entry = GvGet(prefix, tag + "entry", 0);
+   g.target = GvGet(prefix, tag + "target", 0);
+   g.invalidation = GvGet(prefix, tag + "inval", 0);
+   g.breakout_level = GvGet(prefix, tag + "brk", 0);
+   g.min_bars = (int)GvGet(prefix, tag + "minbars", 0);
+   g.max_bars = (int)GvGet(prefix, tag + "maxbars", 0);
+   valid = (g.category >= CF_NONE && g.category <= CF_RANGE_BOUNCE &&
+            g.decision >= CF_SKIP && g.decision <= CF_SETUP &&
+            (g.direction == -1 || g.direction == 0 || g.direction == 1));
+   if(!valid) { CFReading empty = {}; r = empty; return; }
+   r = g;
+}
+
+void SaveTrial(const string &prefix, const string tag, const CFTrial &t)
+{
+   SaveForecast(prefix, tag + "f.", t.forecast);
+   SaveReading(prefix, tag + "p.", t.pending);
+   GvSet(prefix, tag + "plevel", t.pending_level);
+   GvSet(prefix, tag + "pbars", (double)t.pending_bars);
+}
+
+void LoadTrial(const string &prefix, const string tag, CFTrial &t)
+{
+   LoadForecast(prefix, tag + "f.", t.forecast);
+   bool valid = false;
+   LoadReading(prefix, tag + "p.", t.pending, valid);
+   t.pending_level = GvGet(prefix, tag + "plevel", 0);
+   t.pending_bars = (int)GvGet(prefix, tag + "pbars", 0);
+   if(!valid || t.pending_bars <= 0)
+   {
+      CFReading empty = {};
+      t.pending = empty;
+      t.pending_level = 0;
+      t.pending_bars = 0;
+   }
+}
+
+void SaveStreamState(CFStream &s)
+{
+   if(MQL_TESTER) return;
+   if(!s.enabled) return;
+   const string prefix = GvPrefix(s.period);
+   GvSet(prefix, "ver", 1.0);
+   GvSet(prefix, "last_bar", (double)s.last_bar);
+   GvSet(prefix, "waiting", s.waiting_for_new_close ? 1.0 : 0.0);
+   GvSet(prefix, "oc_code", (double)s.last_outcome_code);
+   GvSet(prefix, "oc_close", s.last_outcome_close);
+   SaveForecast(prefix, "base.", s.forecast);
+   SaveForecast(prefix, "mgmt.", s.managed.forecast);
+   GvSet(prefix, "mgmt.warn_adv", s.managed.warning_adverse);
+   GvSet(prefix, "mgmt.warn_fav", s.managed.warning_favorable);
+   GvSet(prefix, "mgmt.warn_bars", (double)s.managed.warning_bars);
+   GvSet(prefix, "mgmt.quiet", (double)s.managed.quiet_bars);
+   GvSet(prefix, "mgmt.progress", s.managed.best_progress);
+   SaveTrial(prefix, "plan.", s.planner);
+   for(int i = 0; i < CF_TRIAL_COUNT; ++i) SaveTrial(prefix, "t" + IntegerToString(i) + ".", s.trials[i]);
+}
+
+void SaveStateAll()
+{
+   if(MQL_TESTER || out_of_range) return;
+   SaveStreamState(streams[0]);
+   SaveStreamState(streams[1]);
+   GlobalVariablesFlush();
+}
+
+bool LoadStreamState(CFStream &s)
+{
+   if(MQL_TESTER) return false;
+   if(!s.enabled) return false;
+   const string prefix = GvPrefix(s.period);
+   if(GvGet(prefix, "ver", -1.0) != 1.0) return false;
+   s.last_bar = (datetime)GvGet(prefix, "last_bar", 0);
+   s.waiting_for_new_close = GvGet(prefix, "waiting", 1.0) != 0;
+   s.last_outcome_code = (CFStatus)(int)GvGet(prefix, "oc_code", 0.0);
+   s.last_outcome_close = GvGet(prefix, "oc_close", 0.0);
+   s.last_outcome = OutcomeText(s.last_outcome_code, s.last_outcome_close);
+   LoadForecast(prefix, "base.", s.forecast);
+   LoadForecast(prefix, "mgmt.", s.managed.forecast);
+   s.managed.warning_adverse = GvGet(prefix, "mgmt.warn_adv", 0);
+   s.managed.warning_favorable = GvGet(prefix, "mgmt.warn_fav", 0);
+   s.managed.warning_bars = (int)GvGet(prefix, "mgmt.warn_bars", 0);
+   s.managed.quiet_bars = (int)GvGet(prefix, "mgmt.quiet", 0);
+   s.managed.best_progress = GvGet(prefix, "mgmt.progress", 0);
+   // Advice is rebuilt on the next closed candle; be honest until then.
+   s.managed.advice = CF_STANDBY;
+   s.managed.explanation = "Restored after session restart; decide on the next close";
+   LoadTrial(prefix, "plan.", s.planner);
+   for(int i = 0; i < CF_TRIAL_COUNT; ++i) LoadTrial(prefix, "t" + IntegerToString(i) + ".", s.trials[i]);
+   return true;
+}
+
+void RestoreStateAll()
+{
+   for(int i = 0; i < 2; ++i) LoadStreamState(streams[i]);
 }
 
 void LogFailed(const ENUM_TIMEFRAMES period)
@@ -268,8 +555,9 @@ void UpdateManaged(CFStream &s, const CFWindow &w, const bool allow_start)
           CFMarketName(s.local_market), s.period == PERIOD_M5 ? CFMarketName(s.higher_market) : "");
    if(old_status == CF_ACTIVE && s.managed.forecast.status != CF_ACTIVE)
    {
-      s.last_outcome = CFStatusName(s.managed.forecast.status);
-      if(s.managed.advice == CF_EXIT) s.last_outcome += " @ close " + observed_close;
+      s.last_outcome_code = s.managed.forecast.status;
+      s.last_outcome_close = s.managed.advice == CF_EXIT ? w.bar[0].close : 0.0;
+      s.last_outcome = OutcomeText(s.last_outcome_code, s.last_outcome_close);
       LogManaged("outcome", s, s.last_bar, observed_close);
    }
    else if(old_status != CF_ACTIVE && s.managed.forecast.status == CF_ACTIVE)
@@ -315,11 +603,12 @@ bool UpdateStream(CFStream &s)
    const datetime newest = iTime(_Symbol, s.period, 1);
    if(current_open <= newest || newest == 0 || newest <= s.last_bar) return false;
 
+   const int catchup = CF_CATCHUP; // Replay everything that closed while away (weekend/restart).
    int count = CF_HISTORY;
    if(s.last_bar != 0)
    {
       const int previous_shift = iBarShift(_Symbol, s.period, s.last_bar, true);
-      if(previous_shift > 1 && previous_shift <= CF_CATCHUP + 1)
+      if(previous_shift > 1 && previous_shift <= catchup + 1)
          count += previous_shift - 1; // Include the old bar for overlap validation.
    }
    MqlRates rates[];
@@ -347,7 +636,7 @@ bool UpdateStream(CFStream &s)
       // CopyRates can make more history available after the first anchor lookup.
       // Retry with the longer request if the anchor now exists inside our cap.
       const int loaded_shift = iBarShift(_Symbol, s.period, s.last_bar, true);
-      if(loaded_shift > 1 && loaded_shift <= CF_CATCHUP + 1 && copied < CF_HISTORY + loaded_shift - 2)
+      if(loaded_shift > 1 && loaded_shift <= catchup + 1 && copied < CF_HISTORY + loaded_shift - 2)
          return false;
    }
    const CFHistoryState replay = CFReplayState(copied, count, overlap);
@@ -374,9 +663,11 @@ bool UpdateStream(CFStream &s)
       {
          s.managed.forecast.status = CF_DATA_GAP;
          s.managed.advice = CF_STANDBY;
-         s.managed.explanation = CFStatusName(CF_DATA_GAP);
+         s.managed.explanation = "Waiting for a new setup";
          s.managed.warning_bars = 0;
-         s.last_outcome = s.managed.explanation;
+         s.last_outcome_code = CF_DATA_GAP;
+         s.last_outcome_close = 0.0;
+         s.last_outcome = CFStatusName(CF_DATA_GAP);
          LogManaged("outcome", s, newest);
       }
       s.planner.pending_bars = 0;
@@ -413,8 +704,68 @@ void Label(const string suffix, const string text, const int x, const int y, con
    ObjectSetString(0, name, OBJPROP_TEXT, text == "" ? " " : text);
 }
 
+string PeriodLabel()
+{
+   switch(Period())
+   {
+      case PERIOD_M1:  return "M1";
+      case PERIOD_M5:  return "M5";
+      case PERIOD_M15: return "M15";
+      case PERIOD_M30: return "M30";
+      case PERIOD_H1:  return "H1";
+      case PERIOD_H4:  return "H4";
+      case PERIOD_D1:  return "D1";
+      case PERIOD_W1:  return "W1";
+      case PERIOD_MN1: return "MN1";
+      default:         return IntegerToString(Period());
+   }
+}
+
+void DrawOnlyLine(const string line, const color ink)
+{
+   const string panel = CF_OBJECTS + "statuspanel";
+   const string label = CF_OBJECTS + "statusline";
+   if(ObjectFind(0, label) >= 0 && ObjectGetString(0, label, OBJPROP_TEXT) == line) return;
+   ObjectsDeleteAll(0, CF_OBJECTS);
+   if(ObjectFind(0, panel) < 0)
+   {
+      ObjectCreate(0, panel, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, panel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, panel, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, panel, OBJPROP_YDISTANCE, 22);
+      ObjectSetInteger(0, panel, OBJPROP_XSIZE, 588);
+      ObjectSetInteger(0, panel, OBJPROP_YSIZE, 64);
+      ObjectSetInteger(0, panel, OBJPROP_BGCOLOR, C'20,29,43');
+      ObjectSetInteger(0, panel, OBJPROP_COLOR, C'56,73,94');
+      ObjectSetInteger(0, panel, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, panel, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, panel, OBJPROP_HIDDEN, true);
+      ObjectSetString(0, panel, OBJPROP_TOOLTIP, "\n");
+   }
+   ObjectCreate(0, label, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, label, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, label, OBJPROP_XDISTANCE, 23);
+   ObjectSetInteger(0, label, OBJPROP_YDISTANCE, 45);
+   ObjectSetInteger(0, label, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, label, OBJPROP_HIDDEN, true);
+   ObjectSetString(0, label, OBJPROP_TOOLTIP, "\n");
+   ObjectSetString(0, label, OBJPROP_FONT, "Segoe UI");
+   ObjectSetInteger(0, label, OBJPROP_FONTSIZE, 11);
+   ObjectSetInteger(0, label, OBJPROP_COLOR, ink);
+   ObjectSetString(0, label, OBJPROP_TEXT, line);
+   g_drawn_status = line;
+   ChartRedraw(0);
+}
+
+void DeleteOnlyLine()
+{
+   ObjectDelete(0, CF_OBJECTS + "statuspanel");
+   ObjectDelete(0, CF_OBJECTS + "statusline");
+}
+
 void Background()
 {
+   DeleteOnlyLine();
    const string name = CF_OBJECTS + "panel";
    if(ObjectFind(0, name) >= 0) return;
    ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
@@ -422,7 +773,7 @@ void Background()
    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 10);
    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 22);
    ObjectSetInteger(0, name, OBJPROP_XSIZE, 588);
-   ObjectSetInteger(0, name, OBJPROP_YSIZE, 391);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, 402);
    ObjectSetInteger(0, name, OBJPROP_BGCOLOR, C'20,29,43');
    ObjectSetInteger(0, name, OBJPROP_COLOR, C'56,73,94');
    ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
@@ -506,12 +857,21 @@ void DrawStream(const CFStream &s, const int y)
 
 void Draw()
 {
+   UpdateMarketStatus();
+   if(g_market_status == CM_CLOSED)
+   {
+      DrawOnlyLine(g_market_text, g_market_color);
+      return;
+   }
+   DeleteOnlyLine();
    Background();
-   Label("title", "Trader  /  " + _Symbol, 23, 30, clrWhite, 12);
+   Label("title", "Trader  /  " + _Symbol, 23, 27, clrWhite, 12);
    Label("mode", "Monitor only - orders off  |  " + (SaveCsv ? ((log_error[0] || log_error[1]) ? "CSV unavailable" : "CSV logging on") : "CSV logging off"),
-         23, 53, C'164,179,198');
-   DrawStream(streams[0], 77);
-   DrawStream(streams[1], 239);
+         23, 49, C'164,179,198');
+   Label("status", g_market_text, 23, 69, g_market_color);
+   DrawStream(streams[0], 92);
+   DrawStream(streams[1], 254);
+   g_drawn_status = g_market_text;
    ChartRedraw(0);
 }
 
@@ -529,6 +889,8 @@ void ResetStream(CFStream &s, const ENUM_TIMEFRAMES period, const bool enabled)
    s.planner.pending_bars = 0;
    s.planner.forecast.status = CF_IDLE;
    s.local_market = s.higher_market = CF_MARKET_UNKNOWN;
+   s.last_outcome_code = CF_IDLE;
+   s.last_outcome_close = 0.0;
    for(int lane = 0; lane < CF_TRIAL_COUNT; ++lane)
    {
       s.trials[lane].forecast.status = CF_IDLE;
@@ -548,10 +910,22 @@ int OnInit()
    log_error[1] = false;
    higher_cache_bar = 0;
    higher_cache_market = CF_MARKET_UNKNOWN;
+   g_market_status = CM_OPEN;
+   g_market_text = "";
+   g_market_was_closed = false;
+   out_of_range = (Period() != PERIOD_M5 && Period() != PERIOD_M15);
+   show_panel = !MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_VISUAL_MODE);
+   if(out_of_range)
+   {
+      // Inert but harmless: keep saved state untouched, show only one line.
+      if(show_panel) DrawOnlyLine("Trader works on M5 / M15 charts only - current chart: " + PeriodLabel(), C'248,136,136');
+      return INIT_SUCCEEDED; // No timer, no CSV, no state restore.
+   }
+   RestoreStateAll();
    if(ReadM5) OpenLogFor(PERIOD_M5);
    if(ReadM15) OpenLogFor(PERIOD_M15);
-   // Nonvisual tests use ticks only and do not need chart objects.
-   show_panel = !MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_VISUAL_MODE);
+   const bool restored = (streams[0].last_bar != 0 || streams[1].last_bar != 0);
+   if(restored) Print("Candle Forecast: state restored from terminal global variables.");
    if(show_panel)
    {
       Draw();
@@ -562,9 +936,27 @@ int OnInit()
 
 void Refresh()
 {
+   if(out_of_range) return;
+   UpdateMarketStatus();
+   if(g_market_status == CM_CLOSED)
+   {
+      if(!g_market_was_closed)
+      {
+         g_market_was_closed = true;
+         Print("Candle Forecast: market closed; monitoring paused (", g_market_text, ").");
+      }
+      if(show_panel) DrawOnlyLine(g_market_text, g_market_color);
+      return;
+   }
+   if(g_market_was_closed)
+   {
+      g_market_was_closed = false;
+      Print("Candle Forecast: market open; monitoring resumed.");
+   }
    const bool m5_changed = UpdateStream(streams[0]);
    const bool m15_changed = UpdateStream(streams[1]);
-   if(show_panel && (m5_changed || m15_changed)) Draw();
+   if(m5_changed || m15_changed) SaveStateAll();
+   if(show_panel && (m5_changed || m15_changed || g_market_text != g_drawn_status)) Draw();
 }
 
 void OnTick()  { Refresh(); }
@@ -573,6 +965,7 @@ void OnTimer() { Refresh(); }
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   SaveStateAll();
    for(int i = 0; i < 2; ++i)
    {
       if(streams[i].managed.forecast.status == CF_ACTIVE)
