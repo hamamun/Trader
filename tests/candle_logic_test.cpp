@@ -591,5 +591,16 @@ int main() {
     set(w,0,102,102.5,101.9,102.2);
     both(w, CF_CONTINUATION, CF_WAIT, 1);
 
-    std::cout << "Candle logic: five categories, mirrored directions, qualification, forecast windows, outcomes, side-by-side experiments, managed advice, contextual planning, and history checks passed.\n";
+    // Autotrading trigger decision.
+    assert(CFEntryMode(CF_REVERSAL, 1, 100, 99, 2.0, false) == CF_ENTRY_MARKET);
+    assert(CFEntryMode(CF_FAILED_BREAKOUT, -1, 100, 101, 2.0, false) == CF_ENTRY_MARKET);
+    assert(CFEntryMode(CF_RANGE_BOUNCE, 1, 100, 99, 2.0, false) == CF_ENTRY_MARKET);
+    assert(CFEntryMode(CF_CONTINUATION, 1, 100, 99, 2.0, true) == CF_ENTRY_MARKET);
+    assert(CFEntryMode(CF_BREAKOUT, 1, 100.6, 100.0, 2.0, true) == CF_ENTRY_MARKET);
+    assert(CFEntryMode(CF_BREAKOUT, 1, 100.2, 100.0, 2.0, true) == CF_ENTRY_PENDING);
+    assert(CFEntryMode(CF_BREAKOUT, 1, 100.6, 100.0, 2.0, false) == CF_ENTRY_PENDING);
+    assert(CFEntryMode(CF_BREAKOUT, -1, 99.4, 100.0, 2.0, true) == CF_ENTRY_MARKET);
+    assert(CFEntryMode(CF_BREAKOUT, -1, 99.8, 100.0, 2.0, true) == CF_ENTRY_PENDING);
+
+    std::cout << "Candle logic: five categories, mirrored directions, qualification, forecast windows, outcomes, side-by-side experiments, managed advice, contextual planning, history checks, and the autotrading trigger decision passed.\n";
 }

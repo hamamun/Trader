@@ -1,7 +1,8 @@
 #property strict
-#property version   "1.49"
-#property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
+#property version   "1.50"
+#property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
+#include <Trade/Trade.mqh>
 #include "CandleLogic.mqh"
 
 input bool ReadM5          = true;  // Read M5 candles
@@ -11,6 +12,12 @@ input bool AlertOnNewSetup = false; // MT5 popup for a new forecast
 input bool SaveCsv         = true;  // Log readings, forecasts and outcomes to CSV
 input bool CompareSwings   = true;  // Log the standalone confirmed-swing comparison
 input bool CompareVariants = true;  // Log the other experiments and all upgrades together
+input bool   AutoTrading  = true;   // Send real orders when a setup qualifies (false = monitor only)
+input bool   UseStopLoss  = true;   // Attach the invalidation level as stop loss
+input double TradeLots    = 0.01;    // Fixed trade size per order (no risk-based sizing)
+input int    PendingBars  = 3;       // Candles a pending stop order waits before auto-cancelling
+input long   Magic        = 20261123;// Magic number for Trader orders
+input int    MaxSlippage  = 100;     // Max slippage in points for market orders
 
 #define CF_OBJECTS "CandleForecast."
 #define CF_TRIAL_COUNT 6
@@ -31,9 +38,14 @@ struct CFStream
    string last_outcome;
    CFStatus last_outcome_code;
    double last_outcome_close;
+   ulong auto_ticket;      // Pending order we placed (0 = none)
+   datetime auto_created;  // When it was placed
+   double auto_dead_level; // Close back through this level cancels the idea (0 = none)
+   int auto_direction;     // +1 buy stop, -1 sell stop
 };
 
 CFStream streams[2];
+CTrade auto_trade;
 double chart_tick_size;
 int csv[2] = {INVALID_HANDLE, INVALID_HANDLE};
 bool log_error[2] = {false, false};
@@ -184,6 +196,198 @@ string ActiveSummary()
    if(streams[0].managed.forecast.status == CF_ACTIVE) summary += "  |  M5 forecast active";
    if(streams[1].managed.forecast.status == CF_ACTIVE) summary += "  |  M15 forecast active";
    return summary;
+}
+
+int MarketFilling()
+{
+   const long mode = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((mode & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
+   if((mode & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+}
+
+bool AutoBusy() // one Trader trade per symbol at a time
+{
+   for(int i = 0; i < PositionsTotal(); ++i)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         (long)PositionGetInteger(POSITION_MAGIC) == (long)Magic)
+         return true;
+   }
+   return false;
+}
+
+bool AutoHasPending()
+{
+   for(int i = 0; i < OrdersTotal(); ++i)
+   {
+      const ulong ticket = OrderGetTicket(i);
+      if(ticket != 0 && OrderGetString(ORDER_SYMBOL) == _Symbol &&
+         (long)OrderGetInteger(ORDER_MAGIC) == (long)Magic)
+         return true;
+   }
+   return false;
+}
+
+void AutoStopsAndTarget(const int direction, const double ref, const double invalidation,
+                        const double target, double &sl, double &tp)
+{
+   const double stops = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   sl = 0.0;
+   tp = 0.0;
+   if(UseStopLoss && invalidation > 0.0)
+   {
+      if(direction * (ref - invalidation) >= stops) sl = NormalizeDouble(invalidation, _Digits);
+      else Print("Trader: stop loss ", Price(invalidation), " is closer than the broker minimum (",
+                 Price(stops), "); order will go WITHOUT a stop loss.");
+   }
+   if(target > 0.0)
+   {
+      if(direction * (target - ref) >= stops) tp = NormalizeDouble(target, _Digits);
+      else Print("Trader: take profit ", Price(target), " is closer than the broker minimum (",
+                 Price(stops), "); order will go WITHOUT a take profit.");
+   }
+}
+
+// Entry gate (points 1-3, precise rules). Fires on a fresh closed signal candle only.
+// A = market when the candle proved the move (or is a turning/continuation setup);
+// B = pending stop beyond the candle when a breakout only hinted at it.
+void AutoTradeSignal(CFStream &s, const CFWindow &w)
+{
+   if(!AutoTrading) return;
+   if(MQLInfoInteger(MQL_TESTER)) return;   // never send orders from backtests
+   if(out_of_range) return;
+   const CFReading &r = s.reading;
+   if(r.decision != CF_SETUP || r.category == CF_NONE) return;
+   if(g_market_status != CM_OPEN)
+   {
+      Print("Trader: setup found but trading is withheld/closed (", g_market_text, "); no order sent.");
+      return;
+   }
+   if(AutoBusy() || AutoHasPending())
+   {
+      Print("Trader: ", FrameName(s.period), " has a setup but a Trader position/order is already open on ",
+            _Symbol, "; no new trade.");
+      return;
+   }
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ||
+      !AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+   {
+      Print("Trader: AutoTrading input is on but terminal/account does not allow automated trading; no order sent.");
+      return;
+   }
+   const MqlRates &b = w.bar[0];
+   const int direction = r.direction;
+   const double typical = CFTypicalRange(w, 1);
+   const bool strong = CFImpulse(b, direction, typical);
+   const int mode = CFEntryMode(r.category, direction, b.close, r.breakout_level, typical, strong);
+   const string tag = StringFormat("Trader %s %s", FrameName(s.period), mode == CF_ENTRY_MARKET ? "MKT" : "STP");
+   const double current = direction > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                        : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   bool ok = false;
+   double sl, tp;
+
+   if(mode == CF_ENTRY_MARKET)
+   {
+      AutoStopsAndTarget(direction, current, r.invalidation, r.target, sl, tp);
+      ok = direction > 0 ? auto_trade.Buy(TradeLots, _Symbol, 0.0, sl, tp, tag)
+                         : auto_trade.Sell(TradeLots, _Symbol, 0.0, sl, tp, tag);
+   }
+   else
+   {
+      const double buffer = MathMax(chart_tick_size, 0.05 * typical);
+      const double price = NormalizeDouble(direction > 0 ? b.high + buffer : b.low - buffer, _Digits);
+      const double stops = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+      if(direction * (price - current) < stops)
+      {
+         Print("Trader: pending level ", Price(price), " too close to current price; signal skipped.");
+         return;
+      }
+      AutoStopsAndTarget(direction, price, r.invalidation, r.target, sl, tp);
+      ok = direction > 0 ? auto_trade.BuyStop(TradeLots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag)
+                         : auto_trade.SellStop(TradeLots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag);
+      if(ok)
+      {
+         s.auto_ticket = auto_trade.ResultOrder();
+         s.auto_created = TimeCurrent();
+         s.auto_dead_level = r.breakout_level;
+         s.auto_direction = direction;
+      }
+   }
+   if(ok) Print("Trader: ", mode == CF_ENTRY_MARKET ? "market" : "pending", " order placed (", tag, ") ",
+                direction > 0 ? "BUY" : "SELL", " ", DoubleToString(TradeLots, 2),
+                " SL ", sl > 0 ? Price(sl) : "off", " TP ", tp > 0 ? Price(tp) : "off");
+   else Print("Trader: order rejected: ", auto_trade.ResultRetcode(), " ", auto_trade.ResultRetcodeDescription());
+}
+
+void RecoverAutoOrders()
+{
+   if(MQLInfoInteger(MQL_TESTER)) return;
+   for(int i = 0; i < OrdersTotal(); ++i)
+   {
+      const ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if((long)OrderGetInteger(ORDER_MAGIC) != (long)Magic) continue;
+      const ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(type != ORDER_TYPE_BUY_STOP && type != ORDER_TYPE_SELL_STOP) continue;
+      const string comment = OrderGetString(ORDER_COMMENT);
+      int index = -1;
+      if(StringFind(comment, "M15") >= 0) index = 1;
+      else if(StringFind(comment, "M5") >= 0) index = 0;
+      if(index < 0 || streams[index].auto_ticket != 0) continue;
+      streams[index].auto_ticket = ticket;
+      streams[index].auto_created = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
+      streams[index].auto_direction = (type == ORDER_TYPE_BUY_STOP ? 1 : -1);
+      streams[index].auto_dead_level = 0.0; // unknown after restart; lifetime cancel still applies
+      Print("Trader: recovered pending order ", ticket, " for ", FrameName(streams[index].period),
+            " (placed ", TimeToString(streams[index].auto_created, TIME_DATE | TIME_SECONDS), ").");
+   }
+}
+
+void AutoOrdersSweep()
+{
+   if(MQLInfoInteger(MQL_TESTER)) return;
+   for(int i = 0; i < 2; ++i)
+   {
+      CFStream &s = streams[i];
+      if(s.auto_ticket == 0) continue;
+      const ulong ticket = s.auto_ticket;
+      bool found = false;
+      for(int j = 0; j < OrdersTotal(); ++j)
+      {
+         if(OrderGetTicket(j) == ticket) { found = true; break; }
+      }
+      if(!found)
+      {
+         Print("Trader: pending order ", ticket, " no longer exists (filled or cancelled); clearing.");
+         s.auto_ticket = 0;
+         s.auto_dead_level = 0.0;
+         continue;
+      }
+      const double bars = (double)(TimeCurrent() - s.auto_created) / (double)PeriodSeconds(s.period);
+      bool kill = PendingBars > 0 && bars >= PendingBars;
+      string why = "expired after " + IntegerToString(PendingBars) + " " + FrameName(s.period) + " bars without triggering";
+      if(!kill && s.auto_dead_level != 0.0)
+      {
+         const double closed = iClose(_Symbol, s.period, 1);
+         if(closed > 0.0 && s.auto_direction * (closed - s.auto_dead_level) < 0.0)
+         {
+            kill = true;
+            why = "price closed back through " + Price(s.auto_dead_level);
+         }
+      }
+      if(kill)
+      {
+         if(auto_trade.OrderDelete(ticket))
+            Print("Trader: pending order ", ticket, " cancelled - ", why, ".");
+         else
+            Print("Trader: could not cancel pending order ", ticket, ": ", auto_trade.ResultRetcodeDescription());
+         s.auto_ticket = 0;
+         s.auto_dead_level = 0.0;
+      }
+   }
 }
 
 void GvSet(const string &prefix, const string key, const double value)
@@ -768,6 +972,7 @@ void ProcessClosed(CFStream &s, const MqlRates &rates[], const int index, const 
 
    CFStart(s.forecast, s.reading, s.last_bar);
    Log("forecast", s.period, s.forecast.setup, s.last_bar, s.forecast.signal_bar, 0, CF_ACTIVE);
+   if(allow_start) AutoTradeSignal(s, w);
 }
 
 bool UpdateStream(CFStream &s)
@@ -1040,8 +1245,9 @@ void Draw()
    DeleteOnlyLine();
    Background();
    Label("title", "Trader  /  " + _Symbol, 23, 27, clrWhite, 12);
-   Label("mode", "Monitor only - orders off  |  " + (SaveCsv ? ((log_error[0] || log_error[1]) ? "CSV unavailable" : "CSV logging on") : "CSV logging off"),
-         23, 49, C'164,179,198');
+   const string orders_text = AutoTrading ? "AUTOTRADING ON - real orders on qualified setups" : "Monitor only - orders off";
+   Label("mode", orders_text + "  |  " + (SaveCsv ? ((log_error[0] || log_error[1]) ? "CSV unavailable" : "CSV logging on") : "CSV logging off"),
+         23, 49, AutoTrading ? C'248,183,117' : C'164,179,198');
    Label("status", g_market_text, 23, 69, g_market_color);
    DrawStream(streams[0], 92);
    DrawStream(streams[1], 254);
@@ -1071,6 +1277,10 @@ void ResetStream(CFStream &s, const ENUM_TIMEFRAMES period, const bool enabled)
       s.trials[lane].pending_bars = 0;
    }
    s.last_outcome = "";
+   s.auto_ticket = 0;
+   s.auto_created = 0;
+   s.auto_dead_level = 0.0;
+   s.auto_direction = 0;
 }
 
 int OnInit()
@@ -1096,6 +1306,11 @@ int OnInit()
       return INIT_SUCCEEDED; // No timer, no CSV, no state restore.
    }
    RestoreStateAll();
+   auto_trade.SetExpertMagicNumber((ulong)Magic);
+   auto_trade.SetTypeFilling((ENUM_ORDER_TYPE_FILLING)MarketFilling());
+   auto_trade.SetDeviationInPoints((ulong)MaxSlippage);
+   RecoverAutoOrders();
+   if(AutoTrading) Print("Candle Forecast: AutoTrading input is ON - real orders will be sent on qualified setups.");
    if(ReadM5) OpenLogFor(PERIOD_M5);
    if(ReadM15) OpenLogFor(PERIOD_M15);
    const bool restored = (streams[0].last_bar != 0 || streams[1].last_bar != 0);
@@ -1130,6 +1345,7 @@ void Refresh()
    const bool m5_changed = UpdateStream(streams[0]);
    const bool m15_changed = UpdateStream(streams[1]);
    if(m5_changed || m15_changed) SaveStateAll();
+   AutoOrdersSweep();
    if(show_panel)
    {
       // Panel self-heal: if MT5 destroyed the chart objects (timeframe switch), rebuild them.

@@ -202,6 +202,24 @@ double CFTypicalRange(const CFWindow &w, const int start)
    return total / 16.0;
 }
 
+enum CFEntryMode { CF_ENTRY_MARKET, CF_ENTRY_PENDING };
+
+// Autotrading trigger decision made on the signal candle itself.
+// Turning and continuation entries (reversals, failed breaks, range rejections,
+// pullback resumptions) already have their edge at the decision close, so they use
+// the market. Plain breakouts only deserve the market when the close is a
+// convincing move beyond the level; a marginal break is armed as a pending stop
+// instead so a fakeout never fills.
+int CFEntryMode(const CFCategory category, const int direction,
+                const double close, const double breakout_level,
+                const double typical, const bool strong_close)
+{
+   if(category != CF_BREAKOUT) return CF_ENTRY_MARKET;
+   const double beyond = direction * (close - breakout_level);
+   if(strong_close && typical > 0.0 && beyond >= 0.25 * typical) return CF_ENTRY_MARKET;
+   return CF_ENTRY_PENDING;
+}
+
 void CFQualify(CFReading &r, const double tick_size, const double typical)
 {
    r.decision = CF_SKIP;
