@@ -43,10 +43,23 @@ An order is placed only when **all** of these hold, evaluated on a freshly close
 - **Breakouts that only just crept past the level** → a **pending stop order** just beyond the signal candle's high/low (small buffer). If price genuinely continues, it fills; if it fakes out and falls back, nothing trades. The pending order lives for `PendingBars` candles, then cancels; it also cancels early if price closes back through the broken level (idea dead).
 
 - **Stop loss** at the invalidation level (unless `UseStopLoss=false` or the broker's minimum stop distance forbids it — then the order goes without a stop and says so in the journal). **Take profit** at the forecast target (same broker-minimum rule). There is no risk-based sizing — `TradeLots` is fixed and you accepted that.
-- **No exit management yet.** The managed advice (Watch/Exit early/…) is still chart-side guidance only; wiring it to close live positions is the next step, deliberately not included here. **Orders are currently entry-only.**
+- **Exits are wired** for Trader positions only: invalidation, target, managed early-exit and expiry/forecast-over (see above). The advice line itself still never moves levels — it exits positions, it does not adjust stops/targets.
 - Orders never fire in the Strategy Tester. Pending orders survive restarts (recovered on init by magic+comment tag; the dead-level cancel is in-memory only, the lifetime cancel always applies). If a pending vanishes, Trader checks whether a Trader position appeared and logs the real fill price — otherwise it logs the order as gone (filled or cancelled externally).
 
-**What lands in the CSV:** every order action is logged to the same per-symbol `<Symbol>_M5.csv` / `<Symbol>_M15.csv` files as `event=order` (placed — with `mode=market` or `mode=pending` and the fill/pending price), `event=order_fill` (pending filled — `position=<ticket>` and the actual open price/SL/TP from the resulting position), `event=order_cancel` (pending cancelled — `reason=` with lifetime expiry or close-back-through), or `event=order_fail` (rejected/failed — `retcode=` and broker reason). All carry `variant=autotrade`; the exact details live in `management_reason` as `key=value;key=value` fields (lots, ticket, price, sl, tp, reason) — no commas inside values. `observed_close` carries the price too, so existing analyses can filter `event=order*` without a schema change.
+**What lands in the CSV:** every order action is logged to the same per-symbol `<Symbol>_M5.csv` / `<Symbol>_M15.csv` files as `event=order` (placed — with `mode=market` or `mode=pending` and the fill/pending price), `event=order_fill` (pending filled — `position=<ticket>` and the actual open price/SL/TP from the resulting position), `event=order_cancel` (pending cancelled — `reason=` with lifetime expiry or close-back-through), `event=order_fail` (rejected/failed — `retcode=` and broker reason), or `event=exit` (position closed — `reason=` as above). All carry `variant=autotrade`; the exact details live in `management_reason` as `key=value;key=value` fields (lots, ticket, price, sl, tp, reason) — no commas inside values. `observed_close` carries the price too, so existing analyses can filter `event=order*` without a schema change.
+
+## How Trader exits a trade
+
+Four exits for a live Trader position, evaluated on the candle close (plus one mid-candle rule):
+
+1. **Invalidation.** If `UseStopLoss=true` the broker stop loss does it (Trader stays out of the way). If `UseStopLoss=false`, Trader closes at market **mid-candle** the moment price trades through the invalidation level (checked every tick/second).
+2. **Target.** The broker TP does it when present; if the forecast resolves Target on a closed candle Trader closes at market (covers the "broker forced TP off" case). Fill may be better or worse than the target — it is the close price, not a simulated fill.
+3. **Managed early exit.** When the managed advice flips to **Exit** (confirmed warning candle breach, opposite impulse closing through the previous candle, structure break, or failed-breakout rejection), Trader closes at market. Reuses the exact same logic it watches with, no duplicate tuning.
+4. **Expiry / forecast over.** When the baseline forecast ends — Target, Invalidated, Expired (max bars), Ambiguous or Untracked (data gap) — the position closes. Data gaps close the position too: Trader refuses to ride blind.
+
+Pending (stop) orders additionally cancel when: lifetime `PendingBars` reached, price closes back through the broken level, or a fresh **opposite** setup prints on a closed candle.
+
+An exit sets a same-candle re-entry ban: no new order on that timeframe until the next close. Exits never touch manual trades (magic+comment scoped). During a catch-up replay after downtime, an exit fires at current market price even if the resolving close happened while the EA was away. Every exit is logged as `event=exit` with `reason=` (invalidation / target / expiry / early_exit / ambiguous / data_gap / invalidation_midcandle), `price=`, `ticket=`.
 
 ## How it reads candles
 
@@ -79,7 +92,7 @@ On each closed candle, Trader checks the original target and invalidation first.
 - **Watch:** A qualified opposite setup, a strong rejection after progress, or a move that stalls can make the forecast questionable. A stall alert requires three closes without meaningful new progress and is only considered once the earliest estimated bar count has been reached. Watch the next two closes for a break of the warning candle against the forecast. If the warning is not confirmed, return to Hold.
 - **Exit early:** A closed candle confirms the warning, a strong opposite setup closes through the previous candle, or a close breaks the structure supporting the forecast. A breakout can also end early on a close back through its original level. Trader shows the reason and records the exit candle's close, then waits for a fresh qualifying close rather than flipping direction on the same candle.
 
-The advice line runs the same way with CSV disabled. It does **not** close live positions yet (that is the next step). A price move in the forecast's favor is not a realized profit; early exits use the observed candle close as a reference, not a broker fill. **Order entries fire at most once per setup; exits are manual until the exit step lands.**
+The advice line runs the same way with CSV disabled. It **does** close live Trader positions (that timeframe only) when it says Exit. A price move in the forecast's favor is not a realized profit; early exits use the observed candle close as a reference, not a broker fill. **Order entries fire at most once per setup; exits fire on candle close except the mid-candle invalidation rule when broker SL is off.**
 
 ## Side-by-side experiments
 
