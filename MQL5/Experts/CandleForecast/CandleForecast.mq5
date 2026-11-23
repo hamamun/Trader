@@ -1375,6 +1375,12 @@ color AdviceInk(const CFAdvice advice)
    }
 }
 
+string AccountCurrency()
+{
+   const string ccy = AccountInfoString(ACCOUNT_CURRENCY);
+   return ccy == "" ? "USD" : ccy;
+}
+
 string PositionLine(const CFStream &s, color &ink)
 {
    ulong ticket; int type; double open_price, sl, tp;
@@ -1383,12 +1389,39 @@ string PositionLine(const CFStream &s, color &ink)
    const double profit = PositionGetDouble(POSITION_PROFIT);
    const double volume = PositionGetDouble(POSITION_VOLUME);
    const bool is_buy = (type == (int)POSITION_TYPE_BUY);
+   const string ccy = AccountCurrency();
+   const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   const double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    ink = profit >= 0 ? CF_GOOD : CF_BAD;
    string line = StringFormat("POSITION %s %.2f @ %s", is_buy ? "BUY" : "SELL", volume,
                               PanelPrice(open_price));
-   line += "  |  SL " + (sl > 0 ? PanelPrice(sl) : "off");
-   line += "  |  TP " + (tp > 0 ? PanelPrice(tp) : "off");
-   line += "  |  P/L " + PanelMoney(profit);
+   if(sl > 0)
+   {
+      line += "   |   SL " + PanelPrice(sl);
+      if(tick_size > 0 && tick_value > 0)
+         line += StringFormat(" (-%.2f %s)", volume * MathAbs(open_price - sl) / tick_size * tick_value, ccy);
+   }
+   else line += "   |   SL off";
+   if(tp > 0)
+   {
+      line += "   |   TP " + PanelPrice(tp);
+      if(tick_size > 0 && tick_value > 0)
+         line += StringFormat(" (+%.2f %s)", volume * MathAbs(tp - open_price) / tick_size * tick_value, ccy);
+   }
+   else line += "   |   TP off";
+   line += "   |   P/L " + PanelMoney(profit) + " " + ccy;
+   return line;
+}
+
+string PositionBidAskLine(const CFStream &s)
+{
+   ulong ticket; int type; double open_price, sl, tp;
+   if(!FindAutoPosition(s, ticket, type, open_price, sl, tp)) return "";
+   const bool is_buy = (type == (int)POSITION_TYPE_BUY);
+   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   string line = "Bid " + PanelPrice(bid) + "   ·   Ask " + PanelPrice(ask);
+   line += "   ·   exit at " + (is_buy ? "Bid" : "Ask");
    return line;
 }
 
@@ -1480,6 +1513,8 @@ int DrawStream(const CFStream &s, const int y)
       Label(frame + "position", "●", x, y + CF_LINE_H * lines, line_ink);
       Label(frame + "positiontext", pos, x + 16, y + CF_LINE_H * lines, CF_WHITE);
       ++lines;
+      Label(frame + "positionsub", PositionBidAskLine(s), x + 16, y + CF_LINE_H * lines, CF_MUTED);
+      ++lines;
    }
    else
    {
@@ -1538,7 +1573,7 @@ int StreamLineCount(const CFStream &s)
    int lines = 6; // header, market, reading, decision, forecast, advice
    if(s.managed.forecast.status == CF_ACTIVE) ++lines; // progress
    ulong ticket; int type; double price, sl, tp;
-   if(FindAutoPosition(s, ticket, type, price, sl, tp)) ++lines;
+   if(FindAutoPosition(s, ticket, type, price, sl, tp)) lines += 2;
    else if(s.auto_ticket != 0) ++lines;
    if(s.last_outcome != "") ++lines;
    return lines;
@@ -1553,6 +1588,8 @@ void HeartbeatStream(CFStream &s)
    {
       if(ObjectFind(0, CF_OBJECTS + frame + "positiontext") >= 0)
          ObjectSetString(0, CF_OBJECTS + frame + "positiontext", OBJPROP_TEXT, pos);
+      if(ObjectFind(0, CF_OBJECTS + frame + "positionsub") >= 0)
+         ObjectSetString(0, CF_OBJECTS + frame + "positionsub", OBJPROP_TEXT, PositionBidAskLine(s));
       if(ObjectFind(0, CF_OBJECTS + frame + "position") >= 0)
          ObjectSetInteger(0, CF_OBJECTS + frame + "position", OBJPROP_COLOR, ink);
       return;
