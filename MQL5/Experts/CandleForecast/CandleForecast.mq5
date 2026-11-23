@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.50"
+#property version   "1.51"
 #property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
 #include <Trade/Trade.mqh>
@@ -43,6 +43,7 @@ struct CFStream
    double auto_dead_level; // Close back through this level cancels the idea (0 = none)
    int auto_direction;     // +1 buy stop, -1 sell stop
    CFReading auto_signal;  // Reading that armed the pending order (for CSV logging)
+   datetime auto_exit_bar; // Bar whose close banned re-entry (set on any Trader exit)
 };
 
 CFStream streams[2];
@@ -199,6 +200,109 @@ string ActiveSummary()
    return summary;
 }
 
+bool FindAutoPosition(const CFStream &s, ulong &ticket, int &type, double &open_price, double &sl, double &tp)
+{
+   const string tag = FrameName(s.period);
+   for(int i = 0; i < PositionsTotal(); ++i)
+   {
+      const ulong pt = PositionGetTicket(i);
+      if(pt == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)Magic) continue;
+      if(StringFind(PositionGetString(POSITION_COMMENT), tag) < 0) continue;
+      ticket = pt;
+      type = (int)PositionGetInteger(POSITION_TYPE);
+      open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      sl = PositionGetDouble(POSITION_SL);
+      tp = PositionGetDouble(POSITION_TP);
+      return true;
+   }
+   ticket = 0; type = -1; open_price = 0.0; sl = 0.0; tp = 0.0;
+   return false;
+}
+
+void AutoCancelPending(CFStream &s, const string reason)
+{
+   const ulong ticket = s.auto_ticket;
+   if(ticket == 0) return;
+   if(auto_trade.OrderDelete(ticket))
+   {
+      Print("Trader: pending order ", ticket, " cancelled - ", reason, ".");
+      LogAuto("order_cancel", s, 0.0, 0.0, 0.0, ticket, "reason=" + reason);
+   }
+   else
+   {
+      Print("Trader: could not cancel pending order ", ticket, ": ", auto_trade.ResultRetcodeDescription());
+      LogAuto("order_fail", s, 0.0, 0.0, 0.0, ticket,
+              "reason=cancel_failed;detail=" + auto_trade.ResultRetcodeDescription());
+   }
+   s.auto_ticket = 0;
+   s.auto_dead_level = 0.0;
+}
+
+void CloseAuto(CFStream &s, const string reason)
+{
+   ulong ticket; int type; double open_price, sl, tp;
+   if(!FindAutoPosition(s, ticket, type, open_price, sl, tp)) return; // no Trader position on this TF
+   if(!auto_trade.PositionClose(ticket))
+   {
+      Print("Trader: could not close position ", ticket, " (", reason, "): ", auto_trade.ResultRetcodeDescription());
+      LogAuto("order_fail", s, 0.0, 0.0, 0.0, ticket,
+              "reason=close_failed;detail=" + auto_trade.ResultRetcodeDescription());
+      return;
+   }
+   const double price = auto_trade.ResultPrice();
+   s.auto_exit_bar = iTime(_Symbol, s.period, 0);
+   Print("Trader: position ", ticket, " closed (", reason, ") at ", Price(price));
+   LogAuto("exit", s, price, 0.0, 0.0, ticket, "reason=" + reason);
+}
+
+// Exit machinery, per stream, evaluated every refresh (closed or withheld — closing
+// is always permitted even in close-only mode).
+void AutoExits(CFStream &s)
+{
+   if(MQLInfoInteger(MQL_TESTER)) return;
+   if(!AutoTrading) return;
+   ulong ticket; int type; double open_price, sl, tp;
+   if(!FindAutoPosition(s, ticket, type, open_price, sl, tp)) return;
+   const int direction = type == POSITION_TYPE_BUY ? 1 : -1;
+
+   // 1) Mid-candle invalidation — only when the broker stop loss is disabled;
+   //    with UseStopLoss=true the broker already handles this outcome.
+   if(!UseStopLoss && s.forecast.status == CF_ACTIVE)
+   {
+      const double level = s.forecast.setup.invalidation;
+      const double price = direction > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                         : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(direction * (price - level) <= 0.0)
+      {
+         CloseAuto(s, "invalidation_midcandle");
+         return;
+      }
+   }
+   // 2) Managed early exit (adverse close confirmation / opposite impulse / structure break).
+   if(s.managed.advice == CF_EXIT)
+   {
+      CloseAuto(s, "early_exit;detail=" + s.managed.explanation);
+      return;
+   }
+   // 3) Forecast over (target / invalidation / expiry / ambiguous / untracked).
+   if(s.forecast.status != CF_ACTIVE && s.forecast.status != CF_IDLE)
+   {
+      string reason;
+      switch(s.forecast.status)
+      {
+         case CF_TARGET:     reason = "target"; break;
+         case CF_INVALIDATED: reason = "invalidation"; break;
+         case CF_EXPIRED:    reason = "expiry"; break;
+         case CF_AMBIGUOUS:  reason = "ambiguous"; break;
+         case CF_DATA_GAP:   reason = "data_gap"; break;
+         default:            reason = CFStatusName(s.forecast.status); break;
+      }
+      CloseAuto(s, reason);
+   }
+}
+
 int MarketFilling()
 {
    const long mode = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
@@ -297,6 +401,11 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
    if(!AutoTrading) return;
    if(MQLInfoInteger(MQL_TESTER)) return;   // never send orders from backtests
    if(out_of_range) return;
+   if(s.auto_exit_bar != 0 && iTime(_Symbol, s.period, 0) == s.auto_exit_bar)
+   {
+      Print("Trader: an exit happened on this candle; no re-entry until the next close.");
+      return;
+   }
    const CFReading &r = s.reading;
    if(r.decision != CF_SETUP || r.category == CF_NONE) return;
    if(g_market_status != CM_OPEN)
@@ -419,22 +528,10 @@ void AutoOrdersSweep()
       if(!found)
       {
          // Filled? Look for the resulting Trader position with this timeframe's tag.
-         const string tag = FrameName(s.period);
          double open_price = 0.0, sl = 0.0, tp = 0.0;
          ulong pos_ticket = 0;
-         for(int j = 0; j < PositionsTotal(); ++j)
-         {
-            const ulong pt = PositionGetTicket(j);
-            if(pt == 0) continue;
-            if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-            if((long)PositionGetInteger(POSITION_MAGIC) != (long)Magic) continue;
-            if(StringFind(PositionGetString(POSITION_COMMENT), tag) < 0) continue;
-            pos_ticket = pt;
-            open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-            sl = PositionGetDouble(POSITION_SL);
-            tp = PositionGetDouble(POSITION_TP);
-            break;
-         }
+         int ptype = -1;
+         FindAutoPosition(s, pos_ticket, ptype, open_price, sl, tp);
          if(pos_ticket != 0)
          {
             Print("Trader: pending order ", ticket, " filled -> position ", pos_ticket, " at ", Price(open_price));
@@ -461,22 +558,7 @@ void AutoOrdersSweep()
             why = "price closed back through " + Price(s.auto_dead_level);
          }
       }
-      if(kill)
-      {
-         if(auto_trade.OrderDelete(ticket))
-         {
-            Print("Trader: pending order ", ticket, " cancelled - ", why, ".");
-            LogAuto("order_cancel", s, 0.0, 0.0, 0.0, ticket, "reason=" + why);
-         }
-         else
-         {
-            Print("Trader: could not cancel pending order ", ticket, ": ", auto_trade.ResultRetcodeDescription());
-            LogAuto("order_fail", s, 0.0, 0.0, 0.0, ticket,
-                    "reason=cancel_failed;detail=" + auto_trade.ResultRetcodeDescription());
-         }
-         s.auto_ticket = 0;
-         s.auto_dead_level = 0.0;
-      }
+      if(kill) AutoCancelPending(s, why);
    }
 }
 
@@ -1054,6 +1136,9 @@ void ProcessClosed(CFStream &s, const MqlRates &rates[], const int index, const 
       if(s.forecast.status != CF_ACTIVE) EndForecast(s, s.last_bar, Price(w.bar[0].close));
    }
    CFRead(w, chart_tick_size, s.reading);
+   if(AutoTrading && allow_start && s.auto_ticket != 0 &&
+      s.reading.decision == CF_SETUP && s.reading.direction == -s.auto_direction)
+      AutoCancelPending(s, "opposite setup appeared");
    UpdateManaged(s, w, allow_start);
    Log(event, s.period, s.reading, s.last_bar, 0, -1, CF_IDLE);
    for(int lane = 0; lane < CF_TRIAL_COUNT; ++lane)
@@ -1373,6 +1458,7 @@ void ResetStream(CFStream &s, const ENUM_TIMEFRAMES period, const bool enabled)
    s.auto_direction = 0;
    CFReading empty = {};
    s.auto_signal = empty;
+   s.auto_exit_bar = 0;
 }
 
 int OnInit()
@@ -1438,6 +1524,8 @@ void Refresh()
    const bool m15_changed = UpdateStream(streams[1]);
    if(m5_changed || m15_changed) SaveStateAll();
    AutoOrdersSweep();
+   AutoExits(streams[0]);
+   AutoExits(streams[1]);
    if(show_panel)
    {
       // Panel self-heal: if MT5 destroyed the chart objects (timeframe switch), rebuild them.
