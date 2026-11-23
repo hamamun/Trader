@@ -591,6 +591,22 @@ int main() {
     set(w,0,102,102.5,101.9,102.2);
     both(w, CF_CONTINUATION, CF_WAIT, 1);
 
+    // Candle health: bounded [0,1], stronger candles score higher, bad typical guarded.
+    {
+        MqlRates strong_c{0, 100, 103.2, 99.6, 103.0};   // long green, close near high
+        MqlRates doji{0, 100, 103.2, 99.6, 100.05};      // same span, no body, no conviction
+        MqlRates weak_up{0, 100, 103.2, 99.6, 100.4};    // red candle against an up read
+        const double hs = CFCandleHealth(strong_c, 1, 4.0);
+        const double hd = CFCandleHealth(doji, 1, 4.0);
+        const double hb = CFCandleHealth(weak_up, 1, 4.0);
+        assert(hs > 0.6 && hs <= 1.0);
+        assert(hd < hs);
+        assert(hb <= hs);
+        assert(CFCandleHealth(doji, 1, 0.0) >= 0.0 && CFCandleHealth(doji, 1, 0.0) <= 1.0);
+        assert(CFCandleHealth(doji, 0, 4.0) == 0.0);
+        assert(CFCandleHealth(doji, -1, 4.0) >= 0.0 && CFCandleHealth(doji, -1, 4.0) <= 1.0);
+    }
+
     // Autotrading trigger decision.
     assert(CFEntryMode(CF_REVERSAL, 1, 100, 99, 2.0, false) == CF_ENTRY_MARKET);
     assert(CFEntryMode(CF_FAILED_BREAKOUT, -1, 100, 101, 2.0, false) == CF_ENTRY_MARKET);

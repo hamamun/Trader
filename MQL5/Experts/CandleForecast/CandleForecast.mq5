@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.53"
+#property version   "1.55"
 #property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
 #include <Trade/Trade.mqh>
@@ -14,7 +14,7 @@ input bool CompareSwings   = true;  // Log the standalone confirmed-swing compar
 input bool CompareVariants = true;  // Log the other experiments and all upgrades together
 input bool   AutoTrading  = true;   // Send real orders when a setup qualifies (false = monitor only)
 input bool   UseStopLoss  = true;   // Attach the invalidation level as stop loss
-input double TradeLots    = 0.01;    // Fixed trade size per order (no risk-based sizing)
+input bool   UseCalculatedLots = true; // Calculated lot size (true = candle-health sized, false = symbol minimum lot)
 input int    PendingBars  = 3;       // Candles a pending stop order waits before auto-cancelling
 input long   Magic        = 20261123;// Magic number for Trader orders
 input int    MaxSlippage  = 100;     // Max slippage in points for market orders
@@ -62,6 +62,7 @@ color g_market_color = C'80,200,120';
 bool g_market_was_closed = false;
 bool out_of_range = false;
 string g_drawn_status = "";
+datetime g_last_beat = 0;
 
 string FrameName(const ENUM_TIMEFRAMES period) { return period == PERIOD_M5 ? "M5" : "M15"; }
 int CsvIndex(const ENUM_TIMEFRAMES period) { return period == PERIOD_M5 ? 0 : 1; }
@@ -341,19 +342,40 @@ bool AutoHasPending(const CFStream &s)
    return false;
 }
 
+// Symbol-safe lot sizing. Never returns less than the symbol minimum, so a broker
+// cannot reject the order for volume; rounds DOWN to SYMBOL_VOLUME_STEP so it can
+// never exceed the intended size. When UseCalculatedLots is off it returns the
+// symbol minimum exactly. Otherwise scales 1x..3x of the minimum by candle health.
+double AutoLotSize(const MqlRates &b, const int direction, const double typical)
+{
+   const double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   const double step    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   const double safe_min  = min_lot > 0.0 ? min_lot : 0.01;
+   const double safe_max  = max_lot > 0.0 ? MathMax(max_lot, safe_min) : safe_min;
+   const double safe_step = step > 0.0 ? step : safe_min;
+   if(!UseCalculatedLots) return NormalizeDouble(safe_min, 8);
+   const double health = CFCandleHealth(b, direction, typical);
+   double lots = safe_min * (1.0 + 2.0 * health);   // 1x..3x symbol minimum by candle health
+   lots = MathFloor(lots / safe_step + 1e-9) * safe_step;
+   lots = MathMin(MathMax(lots, safe_min), safe_max);
+   return NormalizeDouble(lots, 8);
+}
+
 // Record every order action in the per-stream CSV (event = order / order_cancel /
 // order_fail / order_fill). Variant carries the mode; management_reason carries
-// ticket/lots/sl/tp/price; no commas inside fields.
+// ticket/lots/sl/tp/price; no commas inside fields. lots < 0 means "not applicable".
 void LogAuto(const string event, const CFStream &s, const double price, const double sl, const double tp,
-             const ulong ticket, const string note)
+             const ulong ticket, const string note, const double lots = -1.0)
 {
    const int index = CsvIndex(s.period);
    if(csv[index] == INVALID_HANDLE) return;
-   string details = "lots=" + DoubleToString(TradeLots, 2);
-   if(ticket != 0) details += ";ticket=" + IntegerToString((long)ticket);
-   if(price > 0.0) details += ";price=" + Price(price);
-   details += sl > 0.0 ? ";sl=" + Price(sl) : ";sl=off";
-   details += tp > 0.0 ? ";tp=" + Price(tp) : ";tp=off";
+   string details = "";
+   if(lots >= 0.0) details = "lots=" + DoubleToString(lots, 8);
+   if(ticket != 0) details += (details == "" ? "" : ";") + "ticket=" + IntegerToString((long)ticket);
+   if(price > 0.0) details += (details == "" ? "" : ";") + "price=" + Price(price);
+   details += (details == "" ? "" : ";") + (sl > 0.0 ? "sl=" + Price(sl) : "sl=off");
+   details += (details == "" ? "" : ";") + (tp > 0.0 ? "tp=" + Price(tp) : "tp=off");
    if(note != "") details += ";" + note;
    StringReplace(details, ",", ";"); // keep the CSV single-column safe
    if(s.auto_signal.category != CF_NONE && s.auto_signal.decision == CF_SETUP)
@@ -429,6 +451,7 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
    const int direction = r.direction;
    const double typical = CFTypicalRange(w, 1);
    const bool strong = CFImpulse(b, direction, typical);
+   const double lots = AutoLotSize(b, direction, typical);
    const int mode = CFEntryMode(r.category, direction, b.close, r.breakout_level, typical, strong);
    const string tag = StringFormat("Trader %s %s", FrameName(s.period), mode == CF_ENTRY_MARKET ? "MKT" : "STP");
    const double current = direction > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
@@ -440,8 +463,8 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
    if(mode == CF_ENTRY_MARKET)
    {
       AutoStopsAndTarget(direction, current, r.invalidation, r.target, sl, tp);
-      ok = direction > 0 ? auto_trade.Buy(TradeLots, _Symbol, 0.0, sl, tp, tag)
-                         : auto_trade.Sell(TradeLots, _Symbol, 0.0, sl, tp, tag);
+      ok = direction > 0 ? auto_trade.Buy(lots, _Symbol, 0.0, sl, tp, tag)
+                         : auto_trade.Sell(lots, _Symbol, 0.0, sl, tp, tag);
    }
    else
    {
@@ -455,8 +478,8 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
          return;
       }
       AutoStopsAndTarget(direction, price, r.invalidation, r.target, sl, tp);
-      ok = direction > 0 ? auto_trade.BuyStop(TradeLots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag)
-                         : auto_trade.SellStop(TradeLots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag);
+      ok = direction > 0 ? auto_trade.BuyStop(lots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag)
+                         : auto_trade.SellStop(lots, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, tag);
       if(ok)
       {
          s.auto_ticket = auto_trade.ResultOrder();
@@ -470,12 +493,12 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
    {
       const double fill = auto_trade.ResultPrice() > 0.0 ? auto_trade.ResultPrice() : placed_price;
       Print("Trader: ", mode == CF_ENTRY_MARKET ? "market" : "pending", " order placed (", tag, ") ",
-            direction > 0 ? "BUY" : "SELL", " ", DoubleToString(TradeLots, 2),
+            direction > 0 ? "BUY" : "SELL", " ", DoubleToString(lots, 8),
             " SL ", sl > 0 ? Price(sl) : "off", " TP ", tp > 0 ? Price(tp) : "off");
       if(mode == CF_ENTRY_MARKET)
-         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=market;filled=" + Price(fill));
+         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=market;filled=" + Price(fill), lots);
       else
-         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=pending;pending_price=" + Price(fill));
+         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=pending;pending_price=" + Price(fill), lots);
    }
    else
    {
@@ -1240,26 +1263,6 @@ bool UpdateStream(CFStream &s)
    return true;
 }
 
-void Label(const string suffix, const string text, const int x, const int y, const color ink, const int size = 9)
-{
-   const string name = CF_OBJECTS + suffix;
-   if(ObjectFind(0, name) < 0)
-   {
-      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
-      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
-      ObjectSetString(0, name, OBJPROP_TOOLTIP, "\n");
-      ObjectSetString(0, name, OBJPROP_FONT, "Segoe UI");
-   }
-   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
-   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, ink);
-   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
-   ObjectSetString(0, name, OBJPROP_TEXT, text == "" ? " " : text);
-}
-
 string PeriodLabel()
 {
    switch(Period())
@@ -1275,67 +1278,6 @@ string PeriodLabel()
       case PERIOD_MN1: return "MN1";
       default:         return IntegerToString(Period());
    }
-}
-
-void DrawOnlyLine(const string line, const color ink)
-{
-   const string panel = CF_OBJECTS + "statuspanel";
-   const string label = CF_OBJECTS + "statusline";
-   if(ObjectFind(0, label) >= 0 && ObjectGetString(0, label, OBJPROP_TEXT) == line) return;
-   ObjectsDeleteAll(0, CF_OBJECTS);
-   if(ObjectFind(0, panel) < 0)
-   {
-      ObjectCreate(0, panel, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, panel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      ObjectSetInteger(0, panel, OBJPROP_XDISTANCE, 10);
-      ObjectSetInteger(0, panel, OBJPROP_YDISTANCE, 22);
-      ObjectSetInteger(0, panel, OBJPROP_XSIZE, 588);
-      ObjectSetInteger(0, panel, OBJPROP_YSIZE, 64);
-      ObjectSetInteger(0, panel, OBJPROP_BGCOLOR, C'20,29,43');
-      ObjectSetInteger(0, panel, OBJPROP_COLOR, C'56,73,94');
-      ObjectSetInteger(0, panel, OBJPROP_BORDER_TYPE, BORDER_FLAT);
-      ObjectSetInteger(0, panel, OBJPROP_SELECTABLE, false);
-      ObjectSetInteger(0, panel, OBJPROP_HIDDEN, true);
-      ObjectSetString(0, panel, OBJPROP_TOOLTIP, "\n");
-   }
-   ObjectCreate(0, label, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, label, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-   ObjectSetInteger(0, label, OBJPROP_XDISTANCE, 23);
-   ObjectSetInteger(0, label, OBJPROP_YDISTANCE, 45);
-   ObjectSetInteger(0, label, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, label, OBJPROP_HIDDEN, true);
-   ObjectSetString(0, label, OBJPROP_TOOLTIP, "\n");
-   ObjectSetString(0, label, OBJPROP_FONT, "Segoe UI");
-   ObjectSetInteger(0, label, OBJPROP_FONTSIZE, 11);
-   ObjectSetInteger(0, label, OBJPROP_COLOR, ink);
-   ObjectSetString(0, label, OBJPROP_TEXT, line);
-   g_drawn_status = line;
-   ChartRedraw(0);
-}
-
-void DeleteOnlyLine()
-{
-   ObjectDelete(0, CF_OBJECTS + "statuspanel");
-   ObjectDelete(0, CF_OBJECTS + "statusline");
-}
-
-void Background()
-{
-   DeleteOnlyLine();
-   const string name = CF_OBJECTS + "panel";
-   if(ObjectFind(0, name) >= 0) return;
-   ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 22);
-   ObjectSetInteger(0, name, OBJPROP_XSIZE, 588);
-   ObjectSetInteger(0, name, OBJPROP_YSIZE, 402);
-   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, C'20,29,43');
-   ObjectSetInteger(0, name, OBJPROP_COLOR, C'56,73,94');
-   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
-   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
-   ObjectSetString(0, name, OBJPROP_TOOLTIP, "\n");
 }
 
 void Level(const string frame, const string kind, const bool visible, const double price,
@@ -1360,55 +1302,332 @@ void Level(const string frame, const string kind, const bool visible, const doub
    ObjectSetString(0, name, OBJPROP_TOOLTIP, frame + " " + kind + " @ " + Price(price));
 }
 
-void DrawStream(const CFStream &s, const int y)
+const color CF_BG     = C'15,21,33';   // deep navy card
+const color CF_BORDER = C'44,62,86';   // hairline border
+const color CF_WHITE  = C'236,241,248';
+const color CF_MUTED  = C'152,167,189';
+const color CF_DIM    = C'105,118,140';
+const color CF_M5     = C'115,211,251';
+const color CF_M15    = C'202,172,249';
+const color CF_GOOD   = C'80,220,150';
+const color CF_WARN   = C'247,183,117';
+const color CF_BAD    = C'248,136,136';
+const int CF_PANEL_W  = 760;
+const int CF_LINE_H   = 21;
+const int CF_GAP      = 10;
+
+string PanelPrice(const double value)
+{
+   const string raw = DoubleToString(MathAbs(value), _Digits);
+   const int dot = StringFind(raw, ".");
+   const string whole = dot < 0 ? raw : StringSubstr(raw, 0, dot);
+   const string frac = dot < 0 ? "" : StringSubstr(raw, dot);
+   string grouped = "";
+   const int n = StringLen(whole);
+   for(int i = 0; i < n; ++i)
+   {
+      grouped += StringSubstr(whole, i, 1);
+      const int remaining = n - i - 1;
+      if(remaining > 0 && remaining % 3 == 0) grouped += ",";
+   }
+   return (value < 0 ? "-" : "") + grouped + frac;
+}
+
+string PanelMoney(const double value)
+{
+   return (value >= 0 ? "+" : "-") + PanelPrice(MathAbs(value));
+}
+
+void PanelRect(const string suffix, const int x, const int y, const int w, const int h,
+               const color bg, const color ink)
+{
+   const string name = CF_OBJECTS + suffix;
+   ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, h);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bg);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, ink);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetString(0, name, OBJPROP_TOOLTIP, "\n");
+}
+
+void Divider(const string suffix, const int y)
+{
+   PanelRect(suffix, 22, y, CF_PANEL_W - 44, 1, CF_BORDER, CF_BORDER);
+}
+
+void Label(const string suffix, const string text, const int x, const int y,
+           const color ink, const bool bold = false)
+{
+   const string name = CF_OBJECTS + suffix;
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetString(0, name, OBJPROP_TOOLTIP, "\n");
+   ObjectSetString(0, name, OBJPROP_FONT, bold ? "Segoe UI Semibold" : "Segoe UI");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 10);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, ink);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+string FrameStamp(const datetime value)
+{
+   return TimeToString(value, TIME_HOURS | TIME_MINUTES);
+}
+
+color AdviceInk(const CFAdvice advice)
+{
+   switch(advice)
+   {
+      case CF_EXIT:      return CF_BAD;
+      case CF_WATCH:     return CF_WARN;
+      case CF_SUPPORTED:
+      case CF_NEW:       return CF_GOOD;
+      case CF_HOLD:      return CF_WHITE;
+      default:           return CF_MUTED;
+   }
+}
+
+string AccountCurrency()
+{
+   const string ccy = AccountInfoString(ACCOUNT_CURRENCY);
+   return ccy == "" ? "USD" : ccy;
+}
+
+string PositionLine(const CFStream &s, color &ink)
+{
+   ulong ticket; int type; double open_price, sl, tp;
+   if(!FindAutoPosition(s, ticket, type, open_price, sl, tp)) return "";
+   PositionSelectByTicket(ticket);
+   const double profit = PositionGetDouble(POSITION_PROFIT);
+   const double volume = PositionGetDouble(POSITION_VOLUME);
+   const bool is_buy = (type == (int)POSITION_TYPE_BUY);
+   const string ccy = AccountCurrency();
+   const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   const double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   ink = profit >= 0 ? CF_GOOD : CF_BAD;
+   string line = StringFormat("POSITION %s %.2f @ %s", is_buy ? "BUY" : "SELL", volume,
+                              PanelPrice(open_price));
+   if(sl > 0)
+   {
+      line += "   ·   SL " + PanelPrice(sl);
+      if(tick_size > 0 && tick_value > 0)
+         line += StringFormat(" (-%.2f %s)", volume * MathAbs(open_price - sl) / tick_size * tick_value, ccy);
+   }
+   else line += "   ·   SL off";
+   if(tp > 0)
+   {
+      line += "   ·   TP " + PanelPrice(tp);
+      if(tick_size > 0 && tick_value > 0)
+         line += StringFormat(" (+%.2f %s)", volume * MathAbs(tp - open_price) / tick_size * tick_value, ccy);
+   }
+   else line += "   ·   TP off";
+   line += "   ·   P/L " + PanelMoney(profit) + " " + ccy;
+   return line;
+}
+
+string PositionBidAskLine(const CFStream &s)
+{
+   ulong ticket; int type; double open_price, sl, tp;
+   if(!FindAutoPosition(s, ticket, type, open_price, sl, tp)) return "";
+   const bool is_buy = (type == (int)POSITION_TYPE_BUY);
+   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   string line = "Bid " + PanelPrice(bid) + "   ·   Ask " + PanelPrice(ask);
+   line += "   ·   exit at " + (is_buy ? "Bid" : "Ask");
+   return line;
+}
+
+string PendingLine(const CFStream &s, color &ink)
+{
+   if(s.auto_ticket == 0) return "";
+   ink = CF_WARN;
+   const string dir = s.auto_direction >= 0 ? "BUY STOP" : "SELL STOP";
+   const int elapsed = s.auto_created > 0 ? (int)((TimeCurrent() - s.auto_created) / PeriodSeconds(s.period)) : 0;
+   int left = PendingBars - elapsed;
+   if(left < 0) left = 0;
+   string line = StringFormat("PENDING %s   ·   %d bar%s left   ·   #%I64u", dir, left, left == 1 ? "" : "s", s.auto_ticket);
+   return line;
+}
+
+// Renders one timeframe block and returns how many lines it used.
+int DrawStream(const CFStream &s, const int y)
 {
    const string frame = FrameName(s.period);
-   const color accent = s.period == PERIOD_M5 ? C'115,211,251' : C'202,172,249';
-   const color muted = C'164,179,198';
-   const int x = 23;
-   const bool ready = s.enabled && s.last_bar != 0;
-   const bool active = ready && s.managed.forecast.status == CF_ACTIVE;
-   string heading = frame;
-   if(!s.enabled)   heading += "  |  Disabled";
-   else if(!ready)  heading += "  |  Waiting for closed candle history";
-   else             heading += "  |  Last closed bar opened " + Stamp(s.last_bar);
-   Label(frame + "title", heading, x, y, accent, 10);
-   string market = "Market: " + CFMarketName(s.local_market);
-   if(s.period == PERIOD_M5) market += "  |  M15 context: " + CFMarketName(s.higher_market);
-   Label(frame + "market", ready ? market : "", x, y + 21, muted);
-   Label(frame + "reading", ready ? CFCategoryName(s.reading.category) + "  |  " + s.reading.reason : "",
-         x, y + 39, clrWhite);
-   const string cue = active ? "Candle cue: " : "Plan: ";
-   const string decision = ready ? cue + CFDecisionName(s.plan) + "  |  " + s.plan.qualifier : "";
-   const color decision_color = ready && s.plan.decision == CF_SETUP ? accent : muted;
-   Label(frame + "decision", decision, x, y + 57, decision_color);
+   const color accent = s.period == PERIOD_M5 ? CF_M5 : CF_M15;
+   const int x = 24;
+   int lines = 0;
+   if(!s.enabled)
+   {
+      Label(frame + "title", frame + "   Disabled", x, y, CF_DIM, true);
+      return 2;
+   }
+   const bool ready = s.last_bar != 0;
+   const int header_y = y;
+   Label(frame + "title", frame, x, header_y, accent, true);
+   Label(frame + "last", ready ? "last closed  " + FrameStamp(s.last_bar) : "waiting for closed-candle history",
+         x + 44, header_y, CF_DIM);
+   ++lines;
+   if(!ready) return 2;
 
-   string details = s.waiting_for_new_close ? "Waiting for the next close to start forecasting" : "No active forecast";
-   string progress = "";
+   string market = "Market: " + CFMarketName(s.local_market);
+   if(s.period == PERIOD_M5) market += "   ·   M15 context: " + CFMarketName(s.higher_market);
+   Label(frame + "market", market, x, y + CF_LINE_H * lines, CF_MUTED);
+   ++lines;
+
+   Label(frame + "reading", CFCategoryName(s.reading.category) + "   ", x, y + CF_LINE_H * lines, CF_WHITE, true);
+   Label(frame + "reason", "·  " + s.reading.reason, x + 7 * StringLen(CFCategoryName(s.reading.category)) + 10,
+         y + CF_LINE_H * lines, CF_MUTED);
+   ++lines;
+
+   const bool active = s.managed.forecast.status == CF_ACTIVE;
+   const string cue = active ? "Candle cue: " : "";
+   const string decision = ready ? cue + CFDecisionName(s.plan) + "   ·   " + s.plan.qualifier : "";
+   const color decision_color = s.plan.decision == CF_SETUP ? accent : CF_MUTED;
+   Label(frame + "decision", decision, x, y + CF_LINE_H * lines, decision_color);
+   ++lines;
+
    if(active)
    {
       const string direction = s.managed.forecast.setup.direction > 0 ? "UP" : "DOWN";
-      details = "Active " + direction + " (" + CFCategoryName(s.managed.forecast.setup.category) +
-                ")  |  Target " + Price(s.managed.forecast.setup.target) +
-                "  |  Invalidation " + Price(s.managed.forecast.setup.invalidation);
-      progress = "Ref. " + Price(s.managed.forecast.setup.entry) + "  |  Est. " +
-                 IntegerToString(s.managed.forecast.setup.min_bars) + "-" +
-                 IntegerToString(s.managed.forecast.setup.max_bars) + " bars  |  " +
-                 IntegerToString(s.managed.forecast.bars) + "/" + IntegerToString(s.managed.forecast.setup.max_bars) + " bars elapsed";
+      Label(frame + "forecast",
+            "Active " + direction, x, y + CF_LINE_H * lines, CF_WHITE, true);
+      Label(frame + "levels",
+            "Target " + PanelPrice(s.managed.forecast.setup.target) + "   ·   Invalidation " +
+            PanelPrice(s.managed.forecast.setup.invalidation),
+            x + 90, y + CF_LINE_H * lines, CF_MUTED);
+      ++lines;
+      const double risk = MathAbs(s.managed.forecast.setup.entry - s.managed.forecast.setup.invalidation);
+      const double r_mult = risk > 0 ? s.managed.best_progress / risk : 0.0;
+      Label(frame + "progress",
+            StringFormat("Bar %d/%d   ·   est %d-%d   ·   peak %+.2fR", s.managed.forecast.bars,
+                         s.managed.forecast.setup.max_bars, s.managed.forecast.setup.min_bars,
+                         s.managed.forecast.setup.max_bars, r_mult),
+            x, y + CF_LINE_H * lines, CF_MUTED);
+      ++lines;
    }
-   Label(frame + "forecast", ready ? details : "", x, y + 75, clrWhite);
-   Label(frame + "progress", ready ? progress : "", x, y + 93, muted);
-   const color advice_color = s.managed.advice == CF_EXIT ? C'248,136,136' :
-                              (s.managed.advice == CF_WATCH ? C'247,183,117' : accent);
-   Label(frame + "advice", ready ? CFAdviceName(s.managed.advice) + "  |  " + s.managed.explanation : "",
-         x, y + 111, advice_color);
-   Label(frame + "outcome", ready && s.last_outcome != "" ? "Last outcome: " + s.last_outcome : "",
-         x, y + 129, muted);
+   else
+   {
+      Label(frame + "forecast",
+            s.waiting_for_new_close ? "Waiting for the next close to start forecasting"
+                                    : "No active forecast — watching for setups",
+            x, y + CF_LINE_H * lines, CF_DIM);
+      ++lines;
+   }
+
+   Label(frame + "advice", CFAdviceName(s.managed.advice) + "   ·   " + s.managed.explanation,
+         x, y + CF_LINE_H * lines, AdviceInk(s.managed.advice));
+   ++lines;
+
+   color line_ink = CF_WARN;
+   const string pos = PositionLine(s, line_ink);
+   if(pos != "")
+   {
+      Label(frame + "position", "●", x, y + CF_LINE_H * lines, line_ink);
+      Label(frame + "positiontext", pos, x + 16, y + CF_LINE_H * lines, CF_WHITE);
+      ++lines;
+      Label(frame + "positionsub", PositionBidAskLine(s), x + 16, y + CF_LINE_H * lines, CF_MUTED);
+      ++lines;
+   }
+   else
+   {
+      const string pending = PendingLine(s, line_ink);
+      if(pending != "")
+      {
+         Label(frame + "pending", "●", x, y + CF_LINE_H * lines, line_ink);
+         Label(frame + "pendingtext", pending, x + 16, y + CF_LINE_H * lines, CF_WHITE);
+         ++lines;
+      }
+   }
+
+   if(s.last_outcome != "")
+   {
+      Label(frame + "outcome", "Last:  " + s.last_outcome, x, y + CF_LINE_H * lines, CF_DIM);
+      ++lines;
+   }
+
    Level(frame, " target", active && ShowLevels, active ? s.managed.forecast.setup.target : 0,
          accent, s.period == PERIOD_M5 ? STYLE_DOT : STYLE_DASH);
    Level(frame, " invalidation", active && ShowLevels, active ? s.managed.forecast.setup.invalidation : 0,
-         s.period == PERIOD_M5 ? C'248,136,136' : C'247,183,117',
+         s.period == PERIOD_M5 ? CF_BAD : CF_WARN,
          s.period == PERIOD_M5 ? STYLE_DOT : STYLE_DASH);
+   return lines;
+}
+
+// One pulsing line shown when the market is closed/withheld.
+void DrawOnlyLine(const string line, const color ink)
+{
+   const string panel = CF_OBJECTS + "statuspanel";
+   const string dot = CF_OBJECTS + "statusdot";
+   const string label = CF_OBJECTS + "statusline";
+   ObjectsDeleteAll(0, CF_OBJECTS);
+   PanelRect("statuspanel", 10, 16, CF_PANEL_W, 44, CF_BG, CF_BORDER);
+   ObjectCreate(0, dot, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dot, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, dot, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, dot, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, dot, OBJPROP_HIDDEN, true);
+   ObjectSetString(0, dot, OBJPROP_TOOLTIP, "\n");
+   ObjectSetString(0, dot, OBJPROP_FONT, "Segoe UI");
+   ObjectSetInteger(0, dot, OBJPROP_FONTSIZE, 10);
+   ObjectSetInteger(0, dot, OBJPROP_COLOR, ink);
+   ObjectSetInteger(0, dot, OBJPROP_XDISTANCE, 24);
+   ObjectSetInteger(0, dot, OBJPROP_YDISTANCE, 30);
+   ObjectSetString(0, dot, OBJPROP_TEXT, "●");
+   Label("statusline", line, 42, 30, CF_WHITE, true);
+   g_drawn_status = line;
+   ChartRedraw(0);
+}
+
+int StreamLineCount(const CFStream &s)
+{
+   if(!s.enabled) return 2;
+   if(s.last_bar == 0) return 2;
+   int lines = 6; // header, market, reading, decision, forecast, advice
+   if(s.managed.forecast.status == CF_ACTIVE) ++lines; // progress
+   ulong ticket; int type; double price, sl, tp;
+   if(FindAutoPosition(s, ticket, type, price, sl, tp)) lines += 2;
+   else if(s.auto_ticket != 0) ++lines;
+   if(s.last_outcome != "") ++lines;
+   return lines;
+}
+
+void HeartbeatStream(CFStream &s)
+{
+   const string frame = FrameName(s.period);
+   color ink = CF_WARN;
+   const string pos = PositionLine(s, ink);
+   if(pos != "")
+   {
+      if(ObjectFind(0, CF_OBJECTS + frame + "positiontext") >= 0)
+         ObjectSetString(0, CF_OBJECTS + frame + "positiontext", OBJPROP_TEXT, pos);
+      if(ObjectFind(0, CF_OBJECTS + frame + "positionsub") >= 0)
+         ObjectSetString(0, CF_OBJECTS + frame + "positionsub", OBJPROP_TEXT, PositionBidAskLine(s));
+      if(ObjectFind(0, CF_OBJECTS + frame + "position") >= 0)
+         ObjectSetInteger(0, CF_OBJECTS + frame + "position", OBJPROP_COLOR, ink);
+      return;
+   }
+   const string pending = PendingLine(s, ink);
+   if(pending != "" && ObjectFind(0, CF_OBJECTS + frame + "pendingtext") >= 0)
+      ObjectSetString(0, CF_OBJECTS + frame + "pendingtext", OBJPROP_TEXT, pending);
+}
+
+void Heartbeat()
+{
+   if(ObjectFind(0, CF_OBJECTS + "footerclock") < 0) return;
+   ObjectSetString(0, CF_OBJECTS + "footerclock", OBJPROP_TEXT,
+                   "updated " + TimeToString(TimeCurrent(), TIME_SECONDS));
+   HeartbeatStream(streams[0]);
+   HeartbeatStream(streams[1]);
 }
 
 void Draw()
@@ -1419,15 +1638,45 @@ void Draw()
       DrawOnlyLine(g_market_text + ActiveSummary(), g_market_color);
       return;
    }
-   DeleteOnlyLine();
-   Background();
-   Label("title", "Trader  /  " + _Symbol, 23, 27, clrWhite, 12);
-   const string orders_text = AutoTrading ? "AUTOTRADING ON - real orders on qualified setups" : "Monitor only - orders off";
-   Label("mode", orders_text + "  |  " + (SaveCsv ? ((log_error[0] || log_error[1]) ? "CSV unavailable" : "CSV logging on") : "CSV logging off"),
-         23, 49, AutoTrading ? C'248,183,117' : C'164,179,198');
-   Label("status", g_market_text, 23, 69, g_market_color);
-   DrawStream(streams[0], 92);
-   DrawStream(streams[1], 254);
+   ObjectsDeleteAll(0, CF_OBJECTS);
+   const int m5_lines = StreamLineCount(streams[0]);
+   const int m15_lines = StreamLineCount(streams[1]);
+   const int header_h = 46;
+   const int y_m5 = 16 + header_h + CF_GAP;
+   const int y_m15 = y_m5 + m5_lines * CF_LINE_H + CF_GAP + 1 + CF_GAP;
+   const int footer_y = y_m15 + m15_lines * CF_LINE_H + CF_GAP + 1 + 8;
+   const int height = footer_y + 24;
+   PanelRect("panel", 10, 16, CF_PANEL_W, height, CF_BG, CF_BORDER);
+
+   // Header — one glance: what this is, what the market says, what we're allowed to do.
+   Label("title", "TRADER  /  " + _Symbol, 24, 26, CF_WHITE, true);
+   const color auto_color = AutoTrading ? CF_WARN : CF_DIM;
+   string strip = "● " + (AutoTrading ? "AUTOTRADING ON" : "MONITOR ONLY");
+   strip += "    ·    CSV " + ((SaveCsv && !(log_error[0] || log_error[1])) ? "on" : (SaveCsv ? "error" : "off"));
+   int live = 0;
+   ulong t; int ty; double p, slx, tpx;
+   if(FindAutoPosition(streams[0], t, ty, p, slx, tpx)) ++live;
+   if(FindAutoPosition(streams[1], t, ty, p, slx, tpx)) ++live;
+   const int pendings = (streams[0].auto_ticket != 0 ? 1 : 0) + (streams[1].auto_ticket != 0 ? 1 : 0);
+   strip += "    ·    ";
+   if(live == 0 && pendings == 0) strip += "flat";
+   else
+   {
+      if(live > 0) strip += IntegerToString(live) + (live == 1 ? " position" : " positions");
+      if(live > 0 && pendings > 0) strip += "  ·  ";
+      if(pendings > 0) strip += IntegerToString(pendings) + (pendings == 1 ? " pending" : " pendings");
+   }
+   strip += "    ·    " + g_market_text;
+   Label("status", strip, 24, 48, auto_color, true);
+   Divider("headerdv", 16 + header_h);
+
+   DrawStream(streams[0], y_m5);
+   Divider("middv", y_m5 + m5_lines * CF_LINE_H + CF_GAP);
+   DrawStream(streams[1], y_m15);
+   Divider("footdv", footer_y - 8);
+   Label("footer", "Candle Forecast  ·  closed-candle M5 / M15 reading", 24, footer_y, CF_DIM);
+   Label("footerclock", "updated " + TimeToString(TimeCurrent(), TIME_SECONDS), 560, footer_y, CF_DIM);
+
    g_drawn_status = g_market_text;
    ChartRedraw(0);
 }
@@ -1538,6 +1787,11 @@ void Refresh()
             ObjectFind(0, CF_OBJECTS + "M5title") < 0 ||
             ObjectFind(0, CF_OBJECTS + "M15title") < 0);
       if(missing || m5_changed || m15_changed || g_market_text != g_drawn_status) Draw();
+      if(TimeCurrent() != g_last_beat)
+      {
+         g_last_beat = TimeCurrent();
+         Heartbeat();
+      }
    }
 }
 
