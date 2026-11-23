@@ -328,6 +328,8 @@ void managed_forecast(const int direction) {
     bar = direction > 0 ? w : reflect(w);
     CFManageOnBar(managed, bar, opposite, tick, true);
     assert(managed.forecast.status == CF_TARGET); // Intrabar target beats a close-based decision.
+    // The outcome line reports what happened; the advice line returns to watching.
+    assert(managed.advice == CF_STANDBY && managed.explanation == "Waiting for a new setup");
 
     managed = holding;
     set(w,1,104,108,103,106);

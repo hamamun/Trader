@@ -2,7 +2,7 @@
 #define CANDLE_FORECAST_LOGIC_MQH
 
 #define CF_HISTORY 24
-#define CF_CATCHUP 256
+#define CF_CATCHUP 5000 // Bars replayable after downtime (weekend/holiday/terminal restart); older is untrackable
 
 enum CFHistoryState { CF_HISTORY_RETRY, CF_HISTORY_READY, CF_HISTORY_GAP };
 
@@ -616,8 +616,16 @@ void CFManageOnBar(CFManaged &m, const CFWindow &w, const CFReading &reading,
    if(m.forecast.status != CF_ACTIVE)
    {
       m.warning_bars = 0;
-      m.advice = m.forecast.status == CF_STRUCTURE_EXIT || m.forecast.status == CF_BREAKOUT_EXIT ? CF_EXIT : CF_STANDBY;
-      m.explanation = CFStatusName(m.forecast.status);
+      if(m.forecast.status == CF_STRUCTURE_EXIT || m.forecast.status == CF_BREAKOUT_EXIT)
+      {
+         m.advice = CF_EXIT;
+         m.explanation = CFStatusName(m.forecast.status);
+         return;
+      }
+      // The outcome line already reports what happened; return the advice line
+      // to the watching state instead of repeating it there.
+      m.advice = CF_STANDBY;
+      m.explanation = "Waiting for a new setup";
       return;
    }
 
