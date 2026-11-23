@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.51"
+#property version   "1.52"
 #property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
 #include <Trade/Trade.mqh>
@@ -406,7 +406,7 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
       Print("Trader: an exit happened on this candle; no re-entry until the next close.");
       return;
    }
-   const CFReading &r = s.reading;
+   const CFReading r = s.reading; // value copy: MetaEditor rejects local refs bound to members
    if(r.decision != CF_SETUP || r.category == CF_NONE) return;
    if(g_market_status != CM_OPEN)
    {
@@ -425,7 +425,7 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
       Print("Trader: AutoTrading input is on but terminal/account does not allow automated trading; no order sent.");
       return;
    }
-   const MqlRates &b = w.bar[0];
+   const MqlRates b = w.bar[0];   // value copy, same reason
    const int direction = r.direction;
    const double typical = CFTypicalRange(w, 1);
    const bool strong = CFImpulse(b, direction, typical);
@@ -512,13 +512,9 @@ void RecoverAutoOrders()
    }
 }
 
-void AutoOrdersSweep()
+void AutoSweepStream(CFStream &s)
 {
-   if(MQLInfoInteger(MQL_TESTER)) return;
-   for(int i = 0; i < 2; ++i)
-   {
-      CFStream &s = streams[i];
-      if(s.auto_ticket == 0) continue;
+      if(s.auto_ticket == 0) return;
       const ulong ticket = s.auto_ticket;
       bool found = false;
       for(int j = 0; j < OrdersTotal(); ++j)
@@ -544,7 +540,7 @@ void AutoOrdersSweep()
          }
          s.auto_ticket = 0;
          s.auto_dead_level = 0.0;
-         continue;
+         return;
       }
       const double bars = (double)(TimeCurrent() - s.auto_created) / (double)PeriodSeconds(s.period);
       bool kill = PendingBars > 0 && bars >= PendingBars;
@@ -559,7 +555,13 @@ void AutoOrdersSweep()
          }
       }
       if(kill) AutoCancelPending(s, why);
-   }
+}
+
+void AutoOrdersSweep()
+{
+   if(MQLInfoInteger(MQL_TESTER)) return;
+   AutoSweepStream(streams[0]);
+   AutoSweepStream(streams[1]);
 }
 
 void GvSet(const string &prefix, const string key, const double value)
