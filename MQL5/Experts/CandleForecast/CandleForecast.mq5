@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.48"
+#property version   "1.49"
 #property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
 
 #include "CandleLogic.mqh"
@@ -419,7 +419,7 @@ void SaveStreamState(CFStream &s)
    for(int i = 0; i < CF_TRIAL_COUNT; ++i) SaveTrial(prefix, "t" + IntegerToString(i) + ".", s.trials[i]);
    // Independent mirror: a tiny positional file, if the terminal's global variables misbehave.
    const string path = StatePath(s.period);
-   int handle = FileOpen(path, FILE_WRITE | FILE_BINARY | FILE_SHARE_READ);
+   int handle = FileOpen(path, FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
    if(handle == INVALID_HANDLE) return;
    FileWriteDouble(handle, 20261123.0); // format marker
    FileWriteDouble(handle, 1.0);        // version
@@ -472,7 +472,7 @@ bool LoadStreamStateGlobals(CFStream &s, const string &prefix)
 bool LoadStreamStateFile(CFStream &s)
 {
    const string path = StatePath(s.period);
-   const int handle = FileOpen(path, FILE_READ | FILE_BINARY | FILE_SHARE_READ);
+   const int handle = FileOpen(path, FILE_READ | FILE_BIN | FILE_SHARE_READ);
    if(handle == INVALID_HANDLE) return false;
    double marker, version, v;
    if(!ReadDoubleChecked(handle, marker) || !ReadDoubleChecked(handle, version)) { FileClose(handle); return false; }
