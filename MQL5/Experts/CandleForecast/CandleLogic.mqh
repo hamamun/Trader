@@ -202,7 +202,7 @@ double CFTypicalRange(const CFWindow &w, const int start)
    return total / 16.0;
 }
 
-enum CFEntryMode { CF_ENTRY_MARKET, CF_ENTRY_PENDING };
+enum CFEntryTrigger { CF_ENTRY_MARKET, CF_ENTRY_PENDING };
 
 // Autotrading trigger decision made on the signal candle itself.
 // Turning and continuation entries (reversals, failed breaks, range rejections,

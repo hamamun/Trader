@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.52"
+#property version   "1.53"
 #property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
 #include <Trade/Trade.mqh>
@@ -265,7 +265,7 @@ void AutoExits(CFStream &s)
    if(!AutoTrading) return;
    ulong ticket; int type; double open_price, sl, tp;
    if(!FindAutoPosition(s, ticket, type, open_price, sl, tp)) return;
-   const int direction = type == POSITION_TYPE_BUY ? 1 : -1;
+   const int direction = (type == (int)POSITION_TYPE_BUY) ? 1 : -1;
 
    // 1) Mid-candle invalidation — only when the broker stop loss is disabled;
    //    with UseStopLoss=true the broker already handles this outcome.
