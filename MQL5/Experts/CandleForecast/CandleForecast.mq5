@@ -42,6 +42,7 @@ struct CFStream
    datetime auto_created;  // When it was placed
    double auto_dead_level; // Close back through this level cancels the idea (0 = none)
    int auto_direction;     // +1 buy stop, -1 sell stop
+   CFReading auto_signal;  // Reading that armed the pending order (for CSV logging)
 };
 
 CFStream streams[2];
@@ -206,28 +207,66 @@ int MarketFilling()
    return ORDER_FILLING_RETURN;
 }
 
-bool AutoBusy() // one Trader trade per symbol at a time
+// One Trader trade per symbol PER TIMEFRAME. Manual trades (any magic other
+// than ours) are never considered for any Trader decision.
+bool AutoBusy(const CFStream &s)
 {
+   const string tag = FrameName(s.period);
    for(int i = 0; i < PositionsTotal(); ++i)
    {
       const ulong ticket = PositionGetTicket(i);
-      if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == _Symbol &&
-         (long)PositionGetInteger(POSITION_MAGIC) == (long)Magic)
-         return true;
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != (long)Magic) continue; // manual trades excluded
+      if(StringFind(PositionGetString(POSITION_COMMENT), tag) >= 0) return true;
    }
    return false;
 }
 
-bool AutoHasPending()
+bool AutoHasPending(const CFStream &s)
 {
+   const string tag = FrameName(s.period);
    for(int i = 0; i < OrdersTotal(); ++i)
    {
       const ulong ticket = OrderGetTicket(i);
-      if(ticket != 0 && OrderGetString(ORDER_SYMBOL) == _Symbol &&
-         (long)OrderGetInteger(ORDER_MAGIC) == (long)Magic)
-         return true;
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if((long)OrderGetInteger(ORDER_MAGIC) != (long)Magic) continue;
+      if(StringFind(OrderGetString(ORDER_COMMENT), tag) >= 0) return true;
    }
    return false;
+}
+
+// Record every order action in the per-stream CSV (event = order / order_cancel /
+// order_fail / order_fill). Variant carries the mode; management_reason carries
+// ticket/lots/sl/tp/price; no commas inside fields.
+void LogAuto(const string event, const CFStream &s, const double price, const double sl, const double tp,
+             const ulong ticket, const string note)
+{
+   const int index = CsvIndex(s.period);
+   if(csv[index] == INVALID_HANDLE) return;
+   string details = "lots=" + DoubleToString(TradeLots, 2);
+   if(ticket != 0) details += ";ticket=" + IntegerToString((long)ticket);
+   if(price > 0.0) details += ";price=" + Price(price);
+   details += sl > 0.0 ? ";sl=" + Price(sl) : ";sl=off";
+   details += tp > 0.0 ? ";tp=" + Price(tp) : ";tp=off";
+   if(note != "") details += ";" + note;
+   StringReplace(details, ",", ";"); // keep the CSV single-column safe
+   if(s.auto_signal.category != CF_NONE && s.auto_signal.decision == CF_SETUP)
+   {
+      // market vs pending is distinguished by the mode=... field in management_reason
+      Log(event, s.period, s.auto_signal, s.last_bar, s.last_bar, -1, CF_ACTIVE,
+          "autotrade", Price(price), "", details, CFMarketName(s.local_market),
+          s.period == PERIOD_M5 ? CFMarketName(s.higher_market) : "");
+      return;
+   }
+   // No live reading (e.g. after a restart): minimal row, no fake context.
+   if(FileWrite(csv[index], event, _Symbol, FrameName(s.period),
+                s.last_bar > 0 ? Stamp(s.last_bar) : "", "", "", "", "", "", "",
+                "", "", "", "", "", "", "", "", "autotrade", Price(price), "", "",
+                details, "", "") == 0)
+      LogFailed(s.period);
+   FileFlush(csv[index]);
 }
 
 void AutoStopsAndTarget(const int direction, const double ref, const double invalidation,
@@ -265,10 +304,10 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
       Print("Trader: setup found but trading is withheld/closed (", g_market_text, "); no order sent.");
       return;
    }
-   if(AutoBusy() || AutoHasPending())
+   if(AutoBusy(s) || AutoHasPending(s))
    {
-      Print("Trader: ", FrameName(s.period), " has a setup but a Trader position/order is already open on ",
-            _Symbol, "; no new trade.");
+      Print("Trader: ", FrameName(s.period), " has a setup but a Trader ", FrameName(s.period),
+            " position/order is already open on ", _Symbol, " (the other timeframe is unaffected); no new trade.");
       return;
    }
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ||
@@ -287,6 +326,7 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
                                         : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    bool ok = false;
    double sl, tp;
+   double placed_price = current;  // market: filled near here; pending: the stop level
 
    if(mode == CF_ENTRY_MARKET)
    {
@@ -298,6 +338,7 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
    {
       const double buffer = MathMax(chart_tick_size, 0.05 * typical);
       const double price = NormalizeDouble(direction > 0 ? b.high + buffer : b.low - buffer, _Digits);
+      placed_price = price;
       const double stops = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
       if(direction * (price - current) < stops)
       {
@@ -313,12 +354,28 @@ void AutoTradeSignal(CFStream &s, const CFWindow &w)
          s.auto_created = TimeCurrent();
          s.auto_dead_level = r.breakout_level;
          s.auto_direction = direction;
+         s.auto_signal = r;
       }
    }
-   if(ok) Print("Trader: ", mode == CF_ENTRY_MARKET ? "market" : "pending", " order placed (", tag, ") ",
-                direction > 0 ? "BUY" : "SELL", " ", DoubleToString(TradeLots, 2),
-                " SL ", sl > 0 ? Price(sl) : "off", " TP ", tp > 0 ? Price(tp) : "off");
-   else Print("Trader: order rejected: ", auto_trade.ResultRetcode(), " ", auto_trade.ResultRetcodeDescription());
+   if(ok)
+   {
+      const double fill = auto_trade.ResultPrice() > 0.0 ? auto_trade.ResultPrice() : placed_price;
+      Print("Trader: ", mode == CF_ENTRY_MARKET ? "market" : "pending", " order placed (", tag, ") ",
+            direction > 0 ? "BUY" : "SELL", " ", DoubleToString(TradeLots, 2),
+            " SL ", sl > 0 ? Price(sl) : "off", " TP ", tp > 0 ? Price(tp) : "off");
+      if(mode == CF_ENTRY_MARKET)
+         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=market;filled=" + Price(fill));
+      else
+         LogAuto("order", s, fill, sl, tp, auto_trade.ResultOrder(), "mode=pending;pending_price=" + Price(fill));
+   }
+   else
+   {
+      Print("Trader: order rejected: ", auto_trade.ResultRetcode(), " ", auto_trade.ResultRetcodeDescription());
+      s.auto_signal = r;
+      LogAuto("order_fail", s, 0.0, 0.0, 0.0, 0,
+              StringFormat("mode=%s;retcode=%d;reason=%s", mode == CF_ENTRY_MARKET ? "market" : "pending",
+                           (int)auto_trade.ResultRetcode(), auto_trade.ResultRetcodeDescription()));
+   }
 }
 
 void RecoverAutoOrders()
@@ -361,7 +418,33 @@ void AutoOrdersSweep()
       }
       if(!found)
       {
-         Print("Trader: pending order ", ticket, " no longer exists (filled or cancelled); clearing.");
+         // Filled? Look for the resulting Trader position with this timeframe's tag.
+         const string tag = FrameName(s.period);
+         double open_price = 0.0, sl = 0.0, tp = 0.0;
+         ulong pos_ticket = 0;
+         for(int j = 0; j < PositionsTotal(); ++j)
+         {
+            const ulong pt = PositionGetTicket(j);
+            if(pt == 0) continue;
+            if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+            if((long)PositionGetInteger(POSITION_MAGIC) != (long)Magic) continue;
+            if(StringFind(PositionGetString(POSITION_COMMENT), tag) < 0) continue;
+            pos_ticket = pt;
+            open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+            sl = PositionGetDouble(POSITION_SL);
+            tp = PositionGetDouble(POSITION_TP);
+            break;
+         }
+         if(pos_ticket != 0)
+         {
+            Print("Trader: pending order ", ticket, " filled -> position ", pos_ticket, " at ", Price(open_price));
+            LogAuto("order_fill", s, open_price, sl, tp, ticket, "reason=pending_filled;position=" + IntegerToString((long)pos_ticket));
+         }
+         else
+         {
+            Print("Trader: pending order ", ticket, " no longer exists (filled or cancelled externally); clearing.");
+            LogAuto("order_fill", s, 0.0, 0.0, 0.0, ticket, "reason=pending_gone_fill_or_external");
+         }
          s.auto_ticket = 0;
          s.auto_dead_level = 0.0;
          continue;
@@ -381,9 +464,16 @@ void AutoOrdersSweep()
       if(kill)
       {
          if(auto_trade.OrderDelete(ticket))
+         {
             Print("Trader: pending order ", ticket, " cancelled - ", why, ".");
+            LogAuto("order_cancel", s, 0.0, 0.0, 0.0, ticket, "reason=" + why);
+         }
          else
+         {
             Print("Trader: could not cancel pending order ", ticket, ": ", auto_trade.ResultRetcodeDescription());
+            LogAuto("order_fail", s, 0.0, 0.0, 0.0, ticket,
+                    "reason=cancel_failed;detail=" + auto_trade.ResultRetcodeDescription());
+         }
          s.auto_ticket = 0;
          s.auto_dead_level = 0.0;
       }
@@ -1281,6 +1371,8 @@ void ResetStream(CFStream &s, const ENUM_TIMEFRAMES period, const bool enabled)
    s.auto_created = 0;
    s.auto_dead_level = 0.0;
    s.auto_direction = 0;
+   CFReading empty = {};
+   s.auto_signal = empty;
 }
 
 int OnInit()

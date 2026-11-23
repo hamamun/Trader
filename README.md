@@ -34,7 +34,7 @@ An order is placed only when **all** of these hold, evaluated on a freshly close
 
 1. **A qualified setup exists** — the same `Buy setup` / `Sell setup` signal you see on the panel (direction, defined invalidation, target far enough away).
 2. **The bigger picture agrees** — the contextual filter that vetoes counter-trend plans already applies to what reaches the panel (local trend / higher-timeframe opposition). Trader does not fight a clear M15 trend for an M5 entry.
-3. **The moment is sane** — the market is open (no order while trading is halted), and only **one Trader position/order per symbol at a time** (magic `Magic`).
+3. **The moment is sane** — the market is open (no order while trading is halted), automated trading allowed, and only **one Trader position/order per symbol per timeframe** (magic `Magic`; M5 and M15 may each hold one simultaneously). **Manual trades are never considered** — Trader reads magic and comment, and only recognizes its own orders/positions.
 
 **Which order: A (market) or B (pending stop)?** Decided at signal time from the signal candle itself, by deterministic rule:
 
@@ -44,7 +44,9 @@ An order is placed only when **all** of these hold, evaluated on a freshly close
 
 - **Stop loss** at the invalidation level (unless `UseStopLoss=false` or the broker's minimum stop distance forbids it — then the order goes without a stop and says so in the journal). **Take profit** at the forecast target (same broker-minimum rule). There is no risk-based sizing — `TradeLots` is fixed and you accepted that.
 - **No exit management yet.** The managed advice (Watch/Exit early/…) is still chart-side guidance only; wiring it to close live positions is the next step, deliberately not included here. **Orders are currently entry-only.**
-- Orders never fire in the Strategy Tester. Pending orders survive restarts (recovered on init; the dead-level cancel applies after a restart, the lifetime cancel always applies).
+- Orders never fire in the Strategy Tester. Pending orders survive restarts (recovered on init by magic+comment tag; the dead-level cancel is in-memory only, the lifetime cancel always applies). If a pending vanishes, Trader checks whether a Trader position appeared and logs the real fill price — otherwise it logs the order as gone (filled or cancelled externally).
+
+**What lands in the CSV:** every order action is logged to the same per-symbol `<Symbol>_M5.csv` / `<Symbol>_M15.csv` files as `event=order` (placed — with `mode=market` or `mode=pending` and the fill/pending price), `event=order_fill` (pending filled — `position=<ticket>` and the actual open price/SL/TP from the resulting position), `event=order_cancel` (pending cancelled — `reason=` with lifetime expiry or close-back-through), or `event=order_fail` (rejected/failed — `retcode=` and broker reason). All carry `variant=autotrade`; the exact details live in `management_reason` as `key=value;key=value` fields (lots, ticket, price, sl, tp, reason) — no commas inside values. `observed_close` carries the price too, so existing analyses can filter `event=order*` without a schema change.
 
 ## How it reads candles
 
