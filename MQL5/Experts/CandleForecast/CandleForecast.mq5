@@ -1397,19 +1397,19 @@ string PositionLine(const CFStream &s, color &ink)
                               PanelPrice(open_price));
    if(sl > 0)
    {
-      line += "   |   SL " + PanelPrice(sl);
+      line += "   ·   SL " + PanelPrice(sl);
       if(tick_size > 0 && tick_value > 0)
          line += StringFormat(" (-%.2f %s)", volume * MathAbs(open_price - sl) / tick_size * tick_value, ccy);
    }
-   else line += "   |   SL off";
+   else line += "   ·   SL off";
    if(tp > 0)
    {
-      line += "   |   TP " + PanelPrice(tp);
+      line += "   ·   TP " + PanelPrice(tp);
       if(tick_size > 0 && tick_value > 0)
          line += StringFormat(" (+%.2f %s)", volume * MathAbs(tp - open_price) / tick_size * tick_value, ccy);
    }
-   else line += "   |   TP off";
-   line += "   |   P/L " + PanelMoney(profit) + " " + ccy;
+   else line += "   ·   TP off";
+   line += "   ·   P/L " + PanelMoney(profit) + " " + ccy;
    return line;
 }
 
@@ -1433,7 +1433,7 @@ string PendingLine(const CFStream &s, color &ink)
    const int elapsed = s.auto_created > 0 ? (int)((TimeCurrent() - s.auto_created) / PeriodSeconds(s.period)) : 0;
    int left = PendingBars - elapsed;
    if(left < 0) left = 0;
-   string line = StringFormat("PENDING %s  |  %d bar%s left  |  #%I64u", dir, left, left == 1 ? "" : "s", s.auto_ticket);
+   string line = StringFormat("PENDING %s   ·   %d bar%s left   ·   #%I64u", dir, left, left == 1 ? "" : "s", s.auto_ticket);
    return line;
 }
 
@@ -1452,13 +1452,13 @@ int DrawStream(const CFStream &s, const int y)
    const bool ready = s.last_bar != 0;
    const int header_y = y;
    Label(frame + "title", frame, x, header_y, accent, true);
-   Label(frame + "last", ready ? "last closed  " + FrameStamp(s.last_bar) : "waiting for closed candle history",
+   Label(frame + "last", ready ? "last closed  " + FrameStamp(s.last_bar) : "waiting for closed-candle history",
          x + 44, header_y, CF_DIM);
    ++lines;
    if(!ready) return 2;
 
    string market = "Market: " + CFMarketName(s.local_market);
-   if(s.period == PERIOD_M5) market += "   |   M15 context: " + CFMarketName(s.higher_market);
+   if(s.period == PERIOD_M5) market += "   ·   M15 context: " + CFMarketName(s.higher_market);
    Label(frame + "market", market, x, y + CF_LINE_H * lines, CF_MUTED);
    ++lines;
 
@@ -1487,7 +1487,7 @@ int DrawStream(const CFStream &s, const int y)
       const double risk = MathAbs(s.managed.forecast.setup.entry - s.managed.forecast.setup.invalidation);
       const double r_mult = risk > 0 ? s.managed.best_progress / risk : 0.0;
       Label(frame + "progress",
-            StringFormat("Bar %d/%d   ·   est %d-%d   ·   %+.2fR best", s.managed.forecast.bars,
+            StringFormat("Bar %d/%d   ·   est %d-%d   ·   peak %+.2fR", s.managed.forecast.bars,
                          s.managed.forecast.setup.max_bars, s.managed.forecast.setup.min_bars,
                          s.managed.forecast.setup.max_bars, r_mult),
             x, y + CF_LINE_H * lines, CF_MUTED);
