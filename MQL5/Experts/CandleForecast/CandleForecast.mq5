@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.48"
+#property version   "1.49"
 #property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
 
 #include "CandleLogic.mqh"
@@ -419,7 +419,7 @@ void SaveStreamState(CFStream &s)
    for(int i = 0; i < CF_TRIAL_COUNT; ++i) SaveTrial(prefix, "t" + IntegerToString(i) + ".", s.trials[i]);
    // Independent mirror: a tiny positional file, if the terminal's global variables misbehave.
    const string path = StatePath(s.period);
-   int handle = FileOpen(path, FILE_WRITE | FILE_BINARY | FILE_SHARE_READ);
+   int handle = FileOpen(path, FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
    if(handle == INVALID_HANDLE) return;
    FileWriteDouble(handle, 20261123.0); // format marker
    FileWriteDouble(handle, 1.0);        // version
@@ -472,7 +472,7 @@ bool LoadStreamStateGlobals(CFStream &s, const string &prefix)
 bool LoadStreamStateFile(CFStream &s)
 {
    const string path = StatePath(s.period);
-   const int handle = FileOpen(path, FILE_READ | FILE_BINARY | FILE_SHARE_READ);
+   const int handle = FileOpen(path, FILE_READ | FILE_BIN | FILE_SHARE_READ);
    if(handle == INVALID_HANDLE) return false;
    double marker, version, v;
    if(!ReadDoubleChecked(handle, marker) || !ReadDoubleChecked(handle, version)) { FileClose(handle); return false; }
@@ -1130,11 +1130,17 @@ void Refresh()
    const bool m5_changed = UpdateStream(streams[0]);
    const bool m15_changed = UpdateStream(streams[1]);
    if(m5_changed || m15_changed) SaveStateAll();
-   // Panel self-heal: if MT5 destroyed the chart objects (timeframe switch), rebuild them.
-   if(show_panel && (ObjectFind(0, CF_OBJECTS + "panel") < 0 ||
-                     ObjectFind(0, CF_OBJECTS + "M5title") < 0 ||
-                     ObjectFind(0, CF_OBJECTS + "M15title") < 0)) Draw();
-   else if(show_panel && (m5_changed || m15_changed || g_market_text != g_drawn_status)) Draw();
+   if(show_panel)
+   {
+      // Panel self-heal: if MT5 destroyed the chart objects (timeframe switch), rebuild them.
+      const bool line_mode = (g_market_status == CM_WITHHELD);
+      const bool missing = line_mode
+         ? ObjectFind(0, CF_OBJECTS + "statusline") < 0
+         : (ObjectFind(0, CF_OBJECTS + "panel") < 0 ||
+            ObjectFind(0, CF_OBJECTS + "M5title") < 0 ||
+            ObjectFind(0, CF_OBJECTS + "M15title") < 0);
+      if(missing || m5_changed || m15_changed || g_market_text != g_drawn_status) Draw();
+   }
 }
 
 void OnTick()  { Refresh(); }
