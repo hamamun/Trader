@@ -1,12 +1,12 @@
 # Trader for MT5
 
-A monitor-only MQL5 Expert Advisor. Attach **one copy to one M5 or M15 chart**. It independently reads **both M5 and M15** closed candles for that chart's symbol. It does not use indicators, news, external data, or send orders.
+A rule-based MQL5 Expert Advisor for closed-candle M5/M15 reading. Attach **one copy to one M5 or M15 chart**. It independently reads **both M5 and M15** closed candles for that chart's symbol. It does not use indicators or external data. By default it can place **real orders** (see `AutoTrading`); set `AutoTrading=false` to revert to monitor-only.
 
 ## Install
 
 1. In MT5, open **File → Open Data Folder**.
 2. Copy the whole [`CandleForecast`](MQL5/Experts/CandleForecast) folder into `MQL5/Experts/` in that data folder. Keep `CandleForecast.mq5` and `CandleLogic.mqh` together.
-3. Open `CandleForecast.mq5` in MetaEditor and press **F7** to compile. Refresh **Navigator → Expert Advisors** in MT5 if it does not appear, then attach it to one chart. **Algo Trading does not have to be enabled** for monitoring.
+3. Open `CandleForecast.mq5` in MetaEditor and press **F7** to compile. Refresh **Navigator → Expert Advisors** in MT5 if it does not appear, then attach it to one chart. **Algo Trading must be enabled in the terminal AND the EA must have "Allow Algo Trading" ticked** whenever you want real orders; otherwise Trader only monitors and logs (and says so in the panel). Attach to a demo account first.
 
 ## What you see
 
@@ -21,6 +21,45 @@ A status line at the top of the panel always shows the market state: **Market op
 | `SaveCsv` | On | Save candle readings, started forecasts, and outcomes |
 | `CompareSwings` | On | Log the standalone confirmed-swing comparison; requires `SaveCsv` |
 | `CompareVariants` | On | Log the other experiments and the combined version; requires `SaveCsv` |
+| `AutoTrading` | On | Place real orders on qualified setups; false = monitor only |
+| `UseStopLoss` | On | Attach the invalidation level as the stop loss |
+| `TradeLots` | 0.01 | Fixed trade size per order (no risk-based sizing) |
+| `PendingBars` | 3 | Candles a pending stop order waits before auto-cancelling |
+| `Magic` | 20261123 | Magic number for Trader orders |
+| `MaxSlippage` | 100 | Max slippage in points for market orders |
+
+## How Trader enters a trade
+
+An order is placed only when **all** of these hold, evaluated on a freshly closed candle (never on skipped/replayed closes):
+
+1. **A qualified setup exists** — the same `Buy setup` / `Sell setup` signal you see on the panel (direction, defined invalidation, target far enough away).
+2. **The bigger picture agrees** — the contextual filter that vetoes counter-trend plans already applies to what reaches the panel (local trend / higher-timeframe opposition). Trader does not fight a clear M15 trend for an M5 entry.
+3. **The moment is sane** — the market is open (no order while trading is halted), automated trading allowed, and only **one Trader position/order per symbol per timeframe** (magic `Magic`; M5 and M15 may each hold one simultaneously). **Manual trades are never considered** — Trader reads magic and comment, and only recognizes its own orders/positions.
+
+**Which order: A (market) or B (pending stop)?** Decided at signal time from the signal candle itself, by deterministic rule:
+
+- **Turning or continuation setups** (failed breakout, reversal, range bounce, continuation) already have their edge at the close → **market order immediately**.
+- **Breakouts that closed decisively** beyond the level (a strong-close candle at least 0.25 x typical range past it) → **market order immediately**.
+- **Breakouts that only just crept past the level** → a **pending stop order** just beyond the signal candle's high/low (small buffer). If price genuinely continues, it fills; if it fakes out and falls back, nothing trades. The pending order lives for `PendingBars` candles, then cancels; it also cancels early if price closes back through the broken level (idea dead).
+
+- **Stop loss** at the invalidation level (unless `UseStopLoss=false` or the broker's minimum stop distance forbids it — then the order goes without a stop and says so in the journal). **Take profit** at the forecast target (same broker-minimum rule). There is no risk-based sizing — `TradeLots` is fixed and you accepted that.
+- **Exits are wired** for Trader positions only: invalidation, target, managed early-exit and expiry/forecast-over (see above). The advice line itself still never moves levels — it exits positions, it does not adjust stops/targets.
+- Orders never fire in the Strategy Tester. Pending orders survive restarts (recovered on init by magic+comment tag; the dead-level cancel is in-memory only, the lifetime cancel always applies). If a pending vanishes, Trader checks whether a Trader position appeared and logs the real fill price — otherwise it logs the order as gone (filled or cancelled externally).
+
+**What lands in the CSV:** every order action is logged to the same per-symbol `<Symbol>_M5.csv` / `<Symbol>_M15.csv` files as `event=order` (placed — with `mode=market` or `mode=pending` and the fill/pending price), `event=order_fill` (pending filled — `position=<ticket>` and the actual open price/SL/TP from the resulting position), `event=order_cancel` (pending cancelled — `reason=` with lifetime expiry or close-back-through), `event=order_fail` (rejected/failed — `retcode=` and broker reason), or `event=exit` (position closed — `reason=` as above). All carry `variant=autotrade`; the exact details live in `management_reason` as `key=value;key=value` fields (lots, ticket, price, sl, tp, reason) — no commas inside values. `observed_close` carries the price too, so existing analyses can filter `event=order*` without a schema change.
+
+## How Trader exits a trade
+
+Four exits for a live Trader position, evaluated on the candle close (plus one mid-candle rule):
+
+1. **Invalidation.** If `UseStopLoss=true` the broker stop loss does it (Trader stays out of the way). If `UseStopLoss=false`, Trader closes at market **mid-candle** the moment price trades through the invalidation level (checked every tick/second).
+2. **Target.** The broker TP does it when present; if the forecast resolves Target on a closed candle Trader closes at market (covers the "broker forced TP off" case). Fill may be better or worse than the target — it is the close price, not a simulated fill.
+3. **Managed early exit.** When the managed advice flips to **Exit** (confirmed warning candle breach, opposite impulse closing through the previous candle, structure break, or failed-breakout rejection), Trader closes at market. Reuses the exact same logic it watches with, no duplicate tuning.
+4. **Expiry / forecast over.** When the baseline forecast ends — Target, Invalidated, Expired (max bars), Ambiguous or Untracked (data gap) — the position closes. Data gaps close the position too: Trader refuses to ride blind.
+
+Pending (stop) orders additionally cancel when: lifetime `PendingBars` reached, price closes back through the broken level, or a fresh **opposite** setup prints on a closed candle.
+
+An exit sets a same-candle re-entry ban: no new order on that timeframe until the next close. Exits never touch manual trades (magic+comment scoped). During a catch-up replay after downtime, an exit fires at current market price even if the resolving close happened while the EA was away. Every exit is logged as `event=exit` with `reason=` (invalidation / target / expiry / early_exit / ambiguous / data_gap / invalidation_midcandle), `price=`, `ticket=`.
 
 ## How it reads candles
 
@@ -31,7 +70,7 @@ The EA compares bodies, wicks, and closes with recent highs and lows. It describ
 - **Tracking:** At most one forecast is active per timeframe. The EA keeps reading candles while it tracks that forecast; later setups do not replace it. An original baseline forecast finishes when a subsequent closed candle has touched the target or invalidation, or when the bar window expires. The panel instead shows a managed forecast that can also end early (see below). If one candle touches both levels, the outcome is marked ambiguous because OHLC doesn't tell us which came first.
 - **Startup:** The EA displays the latest closed candle after loading enough history but waits for the next close before starting a forecast. Changing the chart timeframe still reads the same M5/M15 pair; reinitializing the EA starts a fresh monitoring session. After an interruption, the EA can replay missed closes to update an existing forecast. Only the newest replayed close can start a forecast, and only if the next bar opens at the expected time. A Friday close discovered when the market reopens, for example, cannot start a new forecast. Trader retries incomplete history before replaying; if a complete snapshot no longer contains the required history, the active forecast is recorded as untracked.
 
-## How Trader decides when to act
+## How Trader decides when to act (managed-entry filter)
 
 Trader reads the market context **before** it judges the signal candle. It uses confirmed higher highs/lows or lower highs/lows, a clear sequence of closes if swings are sparse, and repeated reactions near the ends of a sideways range. Otherwise the market is mixed. On M5 it also reads the last M15 candle that was already closed at the M5 decision time. If that data is disabled, missing, or stale, the panel shows **Unavailable** and the local rules still work.
 
@@ -53,7 +92,7 @@ On each closed candle, Trader checks the original target and invalidation first.
 - **Watch:** A qualified opposite setup, a strong rejection after progress, or a move that stalls can make the forecast questionable. A stall alert requires three closes without meaningful new progress and is only considered once the earliest estimated bar count has been reached. Watch the next two closes for a break of the warning candle against the forecast. If the warning is not confirmed, return to Hold.
 - **Exit early:** A closed candle confirms the warning, a strong opposite setup closes through the previous candle, or a close breaks the structure supporting the forecast. A breakout can also end early on a close back through its original level. Trader shows the reason and records the exit candle's close, then waits for a fresh qualifying close rather than flipping direction on the same candle.
 
-The advice is illustrative only. It runs the same way with CSV disabled and never sends orders. A price move in the forecast's favor is not a realized profit; early exits use the observed candle close as a reference, not a broker fill.
+The advice line runs the same way with CSV disabled. It **does** close live Trader positions (that timeframe only) when it says Exit. A price move in the forecast's favor is not a realized profit; early exits use the observed candle close as a reference, not a broker fill. **Order entries fire at most once per setup; exits fire on candle close except the mid-candle invalidation rule when broker SL is off.**
 
 ## Side-by-side experiments
 
@@ -74,4 +113,4 @@ Each variant has one active forecast or pending confirmation per timeframe. A de
 
 Trader keeps its working state in the terminal's global variables (the same mechanism MetaTrader itself uses), under the `Trader.<Symbol>.<Timeframe>.*` namespace, with an independent binary mirror in `MQL5/Files/CandleForecast/state_<Symbol>_<Timeframe>.dat` loaded if the global variables are missing. The active forecast, bars elapsed, warning state, experiment lanes and last outcome are saved on every closed candle and when the EA deinitializes, and restored on the next initialization — so a chart switch, a change of inputs, a terminal restart or a closed-market weekend do not wipe a live forecast. The Strategy Tester ignores these variables and always starts clean. If the EA is attached to any chart other than M5 or M15, it stays inert, leaves saved state untouched and shows a single out-of-range line; switch back to M5/M15 to resume. CSV files are written under `MQL5/Files/CandleForecast/` (or the testing agent's `MQL5/Files/CandleForecast/` directory in the Strategy Tester). Trader keeps one append-only file per symbol and timeframe, named `<Symbol>_M5.csv` and `<Symbol>_M15.csv`, so rows accumulate day after day and the header is written only once. Filter `event` to `forecast` and `outcome`, then match them using **variant + symbol + timeframe + signal-bar open time** within the file. Filter by `variant` and timeframe. `managed` rows include `advice`, `management_reason`, `local_market`, and applicable `higher_market`; `plan` events record the entry decision and `management` events mark changes in active advice. Reading events are context, not started forecasts. The `observed_close` column records the candle close for early-exit comparisons; it does not represent a fill. `session_end` means a forecast was still open when monitoring stopped. Bar times are broker-time **opening** timestamps for completed candles; the reference close is not a fill price.
 
-Run the host-side rule tests with `bash tests/run.sh`. They compile the same candle logic the EA includes, with fixtures for incomplete history, stale closes, and managed outcomes plus a deterministic 20,000-bar stress test. They do not compile or run the EA itself. To verify it in MT5, compile in MetaEditor and run a visual test over several trading sessions. Check that M5 updates at its own closes, M15 only at its own closes, neither uses forming candles, and no orders appear. Repeat with M15 as the test timeframe and review results by timeframe and setup category before considering trade execution. Compare signal counts, target hits, invalidations, expiries, and early exits on a later period. Do not count early exits as target hits; when both variants started on the same signal, compare the early-exit close with the baseline outcome. Allow for trading costs before drawing conclusions.
+Run the host-side rule tests with `bash tests/run.sh`. They compile the same candle logic the EA includes, with fixtures for incomplete history, stale closes, and managed outcomes plus a deterministic 20,000-bar stress test. They do not compile or run the EA itself. To verify it in MT5, compile in MetaEditor and run a visual test over several trading sessions. Check that M5 updates at its own closes, M15 only at its own closes, neither uses forming candles, and no orders appear. Repeat with M15 as the test timeframe. Review results by timeframe and setup category before trusting results. Compare signal counts, target hits, invalidations, expiries, and early exits on a later period. Do not count early exits as target hits; when both variants started on the same signal, compare the early-exit close with the baseline outcome. Allow for trading costs before drawing conclusions. Forward-test on a demo account before real money — the entry backtest has not been run yet.
