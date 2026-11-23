@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.47"
+#property version   "1.48"
 #property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
 
 #include "CandleLogic.mqh"
@@ -339,22 +339,29 @@ void WriteTrialFile(const int handle, const CFTrial &t)
    FileWriteDouble(handle, (double)t.pending_bars);
 }
 
+bool ReadDoubleChecked(const int handle, double &value)
+{
+   if(FileIsEnding(handle)) return false;
+   value = FileReadDouble(handle);
+   return true;
+}
+
 bool ReadForecastFile(const int handle, CFForecast &f)
 {
    CFForecast g = {};
    double v;
-   if(!FileReadDouble(handle, v)) return false; g.status = (CFStatus)(int)v;
-   if(!FileReadDouble(handle, v)) return false; g.signal_bar = (datetime)v;
-   if(!FileReadDouble(handle, v)) return false; g.last_checked_bar = (datetime)v;
-   if(!FileReadDouble(handle, v)) return false; g.bars = (int)v;
-   if(!FileReadDouble(handle, v)) return false; g.setup.category = (CFCategory)(int)v;
-   if(!FileReadDouble(handle, v)) return false; g.setup.direction = (int)v;
-   if(!FileReadDouble(handle, v)) return false; g.setup.entry = v;
-   if(!FileReadDouble(handle, v)) return false; g.setup.target = v;
-   if(!FileReadDouble(handle, v)) return false; g.setup.invalidation = v;
-   if(!FileReadDouble(handle, v)) return false; g.setup.breakout_level = v;
-   if(!FileReadDouble(handle, v)) return false; g.setup.min_bars = (int)v;
-   if(!FileReadDouble(handle, v)) return false; g.setup.max_bars = (int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.status = (CFStatus)(int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.signal_bar = (datetime)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.last_checked_bar = (datetime)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.bars = (int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.setup.category = (CFCategory)(int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.setup.direction = (int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.setup.entry = v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.setup.target = v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.setup.invalidation = v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.setup.breakout_level = v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.setup.min_bars = (int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.setup.max_bars = (int)v;
    if(!ForecastValid(g)) { f.status = CF_IDLE; return true; }
    f = g;
    return true;
@@ -365,17 +372,17 @@ bool ReadTrialFile(const int handle, CFTrial &t)
    if(!ReadForecastFile(handle, t.forecast)) return false;
    CFReading g = {};
    double v;
-   if(!FileReadDouble(handle, v)) return false; g.category = (CFCategory)(int)v;
-   if(!FileReadDouble(handle, v)) return false; g.decision = (CFDecision)(int)v;
-   if(!FileReadDouble(handle, v)) return false; g.direction = (int)v;
-   if(!FileReadDouble(handle, v)) return false; g.entry = v;
-   if(!FileReadDouble(handle, v)) return false; g.target = v;
-   if(!FileReadDouble(handle, v)) return false; g.invalidation = v;
-   if(!FileReadDouble(handle, v)) return false; g.breakout_level = v;
-   if(!FileReadDouble(handle, v)) return false; g.min_bars = (int)v;
-   if(!FileReadDouble(handle, v)) return false; g.max_bars = (int)v;
-   if(!FileReadDouble(handle, v)) return false; t.pending_level = v;
-   if(!FileReadDouble(handle, v)) return false; t.pending_bars = (int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.category = (CFCategory)(int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.decision = (CFDecision)(int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.direction = (int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.entry = v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.target = v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.invalidation = v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.breakout_level = v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.min_bars = (int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; g.max_bars = (int)v;
+   if(!ReadDoubleChecked(handle, v)) return false; t.pending_level = v;
+   if(!ReadDoubleChecked(handle, v)) return false; t.pending_bars = (int)v;
    const bool valid = (g.category >= CF_NONE && g.category <= CF_RANGE_BOUNCE &&
                        g.decision >= CF_SKIP && g.decision <= CF_SETUP &&
                        (g.direction == -1 || g.direction == 0 || g.direction == 1));
@@ -468,28 +475,28 @@ bool LoadStreamStateFile(CFStream &s)
    const int handle = FileOpen(path, FILE_READ | FILE_BINARY | FILE_SHARE_READ);
    if(handle == INVALID_HANDLE) return false;
    double marker, version, v;
-   if(!FileReadDouble(handle, marker) || !FileReadDouble(handle, version)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, marker) || !ReadDoubleChecked(handle, version)) { FileClose(handle); return false; }
    if(marker != 20261123.0 || version != 1.0) { FileClose(handle); return false; }
-   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, v)) { FileClose(handle); return false; }
    s.last_bar = (datetime)v;
-   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, v)) { FileClose(handle); return false; }
    s.waiting_for_new_close = v != 0;
-   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, v)) { FileClose(handle); return false; }
    s.last_outcome_code = (CFStatus)(int)v;
-   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, v)) { FileClose(handle); return false; }
    s.last_outcome_close = v;
    s.last_outcome = OutcomeText(s.last_outcome_code, s.last_outcome_close);
    if(!ReadForecastFile(handle, s.forecast)) { FileClose(handle); return false; }
    if(!ReadForecastFile(handle, s.managed.forecast)) { FileClose(handle); return false; }
-   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, v)) { FileClose(handle); return false; }
    s.managed.warning_adverse = v;
-   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, v)) { FileClose(handle); return false; }
    s.managed.warning_favorable = v;
-   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, v)) { FileClose(handle); return false; }
    s.managed.warning_bars = (int)v;
-   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, v)) { FileClose(handle); return false; }
    s.managed.quiet_bars = (int)v;
-   if(!FileReadDouble(handle, v)) { FileClose(handle); return false; }
+   if(!ReadDoubleChecked(handle, v)) { FileClose(handle); return false; }
    s.managed.best_progress = v;
    if(!ReadTrialFile(handle, s.planner)) { FileClose(handle); return false; }
    for(int i = 0; i < CF_TRIAL_COUNT; ++i)
