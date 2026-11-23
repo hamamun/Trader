@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.57"
+#property version   "1.58"
 #property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
 #include <Trade/Trade.mqh>
@@ -1502,15 +1502,30 @@ string SlTpExitLine(const CFStream &s)
    return line;
 }
 
+// Pending order status fetched LIVE from the terminal each call (OrderSelect +
+// order properties) so the panel shows the real order, not EA bookkeeping.
+// Falls back to EA state if the order cannot be selected (sweep clears it next).
 string PendingLine(const CFStream &s, color &ink)
 {
    if(s.auto_ticket == 0) return "";
    ink = CF_WARN;
-   const string dir = s.auto_direction >= 0 ? "BUY STOP" : "SELL STOP";
    const int elapsed = s.auto_created > 0 ? (int)((TimeCurrent() - s.auto_created) / PeriodSeconds(s.period)) : 0;
    int left = PendingBars - elapsed;
    if(left < 0) left = 0;
-   return StringFormat("PENDING %s  ·  %d bar%s left  ·  #%I64u", dir, left, left == 1 ? "" : "s", s.auto_ticket);
+   const string bars_text = StringFormat("%d bar%s left", left, left == 1 ? "" : "s");
+   if(OrderSelect(s.auto_ticket))
+   {
+      const long type = OrderGetInteger(ORDER_TYPE);
+      const double price = OrderGetDouble(ORDER_PRICE_OPEN);
+      const double volume = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      const bool is_limit = (type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_SELL_LIMIT);
+      const bool is_buy = (type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP);
+      return StringFormat("PENDING %s %s %.2f @ %s  ·  %s",
+                          is_buy ? "BUY" : "SELL", is_limit ? "LIMIT" : "STOP", volume,
+                          PanelPrice(price), bars_text);
+   }
+   return StringFormat("PENDING %s %s  ·  %s", s.auto_direction >= 0 ? "BUY" : "SELL",
+                       "STOP", bars_text);
 }
 
 // Renders one timeframe card and returns how many lines it used.
