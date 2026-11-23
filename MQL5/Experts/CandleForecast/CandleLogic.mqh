@@ -561,7 +561,9 @@ void CFAdvance(CFForecast &f, const MqlRates &closed, const double tick_size)
    // Tick-rounded levels and the broker OHLC can differ by floating-point noise.
    const double epsilon = tick_size * 1e-6;
    const bool hit_target = up ? closed.high >= f.setup.target - epsilon : closed.low <= f.setup.target + epsilon;
-   const bool hit_stop = up ? closed.low <= f.setup.invalidation + epsilon : closed.high >= f.setup.invalidation - epsilon;
+   // Invalidation is close-based: an intra-bar wick through the level is not an exit.
+   // The trade must close beyond the level to be invalidated (breathing room on EMTF catchers).
+   const bool hit_stop = up ? closed.close <= f.setup.invalidation + epsilon : closed.close >= f.setup.invalidation - epsilon;
    if(hit_target && hit_stop) f.status = CF_AMBIGUOUS;
    else if(hit_target)        f.status = CF_TARGET;
    else if(hit_stop)          f.status = CF_INVALIDATED;

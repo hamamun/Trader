@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.56"
+#property version   "1.57"
 #property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
 #include <Trade/Trade.mqh>
@@ -260,7 +260,7 @@ void CloseAuto(CFStream &s, const string reason)
 
 // Exit machinery, per stream, evaluated every refresh (closed or withheld — closing
 // is always permitted even in close-only mode).
-void AutoExits(CFStream &s)
+void AutoExits(CFStream &s, const bool bar_closed)
 {
    if(MQLInfoInteger(MQL_TESTER)) return;
    if(!AutoTrading) return;
@@ -268,16 +268,18 @@ void AutoExits(CFStream &s)
    if(!FindAutoPosition(s, ticket, type, open_price, sl, tp)) return;
    const int direction = (type == (int)POSITION_TYPE_BUY) ? 1 : -1;
 
-   // 1) Mid-candle invalidation — only when the broker stop loss is disabled;
-   //    with UseStopLoss=true the broker already handles this outcome.
-   if(!UseStopLoss && s.forecast.status == CF_ACTIVE)
+   // 1) Invalidation is evaluated at the CLOSE of the bar, never intra-bar.
+   //    Breathing room for trades — a wick through the level is not an exit.
+   //    (With UseStopLoss=true the broker still enforces its own stop intra-bar;
+   //    this rule covers the EA-side decision when no broker stop is attached.)
+   if(bar_closed && !UseStopLoss && s.forecast.status == CF_ACTIVE)
    {
       const double level = s.forecast.setup.invalidation;
       const double price = direction > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                                          : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       if(direction * (price - level) <= 0.0)
       {
-         CloseAuto(s, "invalidation_midcandle");
+         CloseAuto(s, "invalidation_barclose");
          return;
       }
    }
@@ -1302,8 +1304,11 @@ void Level(const string frame, const string kind, const bool visible, const doub
    ObjectSetString(0, name, OBJPROP_TOOLTIP, frame + " " + kind + " @ " + Price(price));
 }
 
-const color CF_BG     = C'15,21,33';   // deep navy card
-const color CF_BORDER = C'44,62,86';   // hairline border
+const color CF_BG     = C'15,21,33';    // page
+const color CF_BAND   = C'30,40,59';    // header band
+const color CF_CARD   = C'22,30,46';    // timeframe card
+const color CF_BORDER = C'44,62,86';    // hairline
+const color CF_TRACK  = C'35,47,69';    // progress track
 const color CF_WHITE  = C'236,241,248';
 const color CF_MUTED  = C'152,167,189';
 const color CF_DIM    = C'105,118,140';
@@ -1312,9 +1317,11 @@ const color CF_M15    = C'202,172,249';
 const color CF_GOOD   = C'80,220,150';
 const color CF_WARN   = C'247,183,117';
 const color CF_BAD    = C'248,136,136';
-const int CF_PANEL_W  = 760;
+const int CF_PANEL_X  = 10;
+const int CF_PANEL_Y  = 16;
+const int CF_PANEL_W  = 820;
 const int CF_LINE_H   = 21;
-const int CF_GAP      = 10;
+const int CF_BAND_H   = 58;
 
 string PanelPrice(const double value)
 {
@@ -1358,7 +1365,7 @@ void PanelRect(const string suffix, const int x, const int y, const int w, const
 
 void Divider(const string suffix, const int y)
 {
-   PanelRect(suffix, 22, y, CF_PANEL_W - 44, 1, CF_BORDER, CF_BORDER);
+   PanelRect(suffix, CF_PANEL_X + 16, y, CF_PANEL_W - 32, 1, CF_BORDER, CF_BORDER);
 }
 
 void Label(const string suffix, const string text, const int x, const int y,
@@ -1377,6 +1384,12 @@ void Label(const string suffix, const string text, const int x, const int y,
    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
    ObjectSetInteger(0, name, OBJPROP_COLOR, ink);
    ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+void FrameStampRight(const string suffix, const string text, const int card_right, const int y, const color ink)
+{
+   const int x = card_right - (int)(9.0 * StringLen(text)) - 12;
+   Label(suffix, text, x, y, ink);
 }
 
 string FrameStamp(const datetime value)
@@ -1403,6 +1416,47 @@ string AccountCurrency()
    return ccy == "" ? "USD" : ccy;
 }
 
+// Live quote strip: Bid / Ask / spread / server clock. Always visible, ticks every second.
+string QuoteStrip()
+{
+   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   const double spr = _Point > 0.0 ? (ask - bid) / _Point : 0.0;
+   return StringFormat("BID %s  ·  ASK %s  ·  SPR %.1f pt  ·  %s",
+                       PanelPrice(bid), PanelPrice(ask), spr,
+                       TimeToString(TimeCurrent(), TIME_SECONDS));
+}
+
+string ActiveSummaryShort()
+{
+   int live = 0;
+   ulong t; int ty; double p, slv, tpv;
+   if(FindAutoPosition(streams[0], t, ty, p, slv, tpv)) ++live;
+   if(FindAutoPosition(streams[1], t, ty, p, slv, tpv)) ++live;
+   const int pend = (streams[0].auto_ticket != 0 ? 1 : 0) + (streams[1].auto_ticket != 0 ? 1 : 0);
+   if(live == 0 && pend == 0) return "flat";
+   string r = "";
+   if(live > 0) r += IntegerToString(live) + (live == 1 ? " position" : " positions");
+   if(live > 0 && pend > 0) r += " · ";
+   if(pend > 0) r += IntegerToString(pend) + (pend == 1 ? " pending" : " pendings");
+   return r;
+}
+
+string MarketChip()
+{
+   if(g_market_status == CM_OPEN) return "Market open";
+   if(g_market_status == CM_CLOSED) return "Market closed";
+   return "Withheld";
+}
+
+string StatusStrip()
+{
+   string s = AutoTrading ? "AUTOTRADING ON" : "MONITOR ONLY";
+   s += "  ·  CSV " + ((SaveCsv && !(log_error[0] || log_error[1])) ? "on" : (SaveCsv ? "error" : "off"));
+   s += "  ·  " + ActiveSummaryShort() + "  ·  " + MarketChip();
+   return s;
+}
+
 string PositionLine(const CFStream &s, color &ink)
 {
    ulong ticket; int type; double open_price, sl, tp;
@@ -1412,38 +1466,39 @@ string PositionLine(const CFStream &s, color &ink)
    const double volume = PositionGetDouble(POSITION_VOLUME);
    const bool is_buy = (type == (int)POSITION_TYPE_BUY);
    const string ccy = AccountCurrency();
-   const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   const double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    ink = profit >= 0 ? CF_GOOD : CF_BAD;
-   string line = StringFormat("POSITION %s %.2f @ %s", is_buy ? "BUY" : "SELL", volume,
-                              PanelPrice(open_price));
-   if(sl > 0)
-   {
-      line += "   ·   SL " + PanelPrice(sl);
-      if(tick_size > 0 && tick_value > 0)
-         line += StringFormat(" (-%.2f %s)", volume * MathAbs(open_price - sl) / tick_size * tick_value, ccy);
-   }
-   else line += "   ·   SL off";
-   if(tp > 0)
-   {
-      line += "   ·   TP " + PanelPrice(tp);
-      if(tick_size > 0 && tick_value > 0)
-         line += StringFormat(" (+%.2f %s)", volume * MathAbs(tp - open_price) / tick_size * tick_value, ccy);
-   }
-   else line += "   ·   TP off";
-   line += "   ·   P/L " + PanelMoney(profit) + " " + ccy;
-   return line;
+   return StringFormat("POSITION %s %.2f @ %s  ·  P/L %s %s", is_buy ? "BUY" : "SELL", volume,
+                       PanelPrice(open_price), PanelMoney(profit), ccy);
 }
 
-string PositionBidAskLine(const CFStream &s)
+string SlTpExitLine(const CFStream &s)
 {
    ulong ticket; int type; double open_price, sl, tp;
    if(!FindAutoPosition(s, ticket, type, open_price, sl, tp)) return "";
    const bool is_buy = (type == (int)POSITION_TYPE_BUY);
-   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   string line = "Bid " + PanelPrice(bid) + "   ·   Ask " + PanelPrice(ask);
-   line += "   ·   exit at " + (is_buy ? "Bid" : "Ask");
+   const string ccy = AccountCurrency();
+   const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   const double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   PositionSelectByTicket(ticket);
+   const double volume = PositionGetDouble(POSITION_VOLUME);
+   string line = "";
+   if(sl > 0.0)
+   {
+      line += "SL " + PanelPrice(sl);
+      if(tick_size > 0.0 && tick_value > 0.0)
+         line += StringFormat(" (-%.2f %s)", volume * MathAbs(open_price - sl) / tick_size * tick_value, ccy);
+   }
+   else line += "SL off";
+   line += "  ·  ";
+   if(tp > 0.0)
+   {
+      line += "TP " + PanelPrice(tp);
+      if(tick_size > 0.0 && tick_value > 0.0)
+         line += StringFormat(" (+%.2f %s)", volume * MathAbs(tp - open_price) / tick_size * tick_value, ccy);
+   }
+   else line += "TP off";
+   line += "  ·  exit at ";
+   line += is_buy ? "Bid" : "Ask";
    return line;
 }
 
@@ -1455,64 +1510,84 @@ string PendingLine(const CFStream &s, color &ink)
    const int elapsed = s.auto_created > 0 ? (int)((TimeCurrent() - s.auto_created) / PeriodSeconds(s.period)) : 0;
    int left = PendingBars - elapsed;
    if(left < 0) left = 0;
-   string line = StringFormat("PENDING %s   ·   %d bar%s left   ·   #%I64u", dir, left, left == 1 ? "" : "s", s.auto_ticket);
-   return line;
+   return StringFormat("PENDING %s  ·  %d bar%s left  ·  #%I64u", dir, left, left == 1 ? "" : "s", s.auto_ticket);
 }
 
-// Renders one timeframe block and returns how many lines it used.
+// Renders one timeframe card and returns how many lines it used.
 int DrawStream(const CFStream &s, const int y)
 {
    const string frame = FrameName(s.period);
    const color accent = s.period == PERIOD_M5 ? CF_M5 : CF_M15;
-   const int x = 24;
+   const int card_x = CF_PANEL_X + 14;
+   const int card_w = CF_PANEL_W - 28;
+   const int card_right = card_x + card_w;
+   const int x = card_x + 18;
    int lines = 0;
+
+   const bool ready = s.enabled && s.last_bar != 0;
+   const int est_lines = StreamLineCount(s);
+   PanelRect(frame + "card", card_x, y, card_w, est_lines * CF_LINE_H + 16, CF_CARD, CF_BORDER);
+   PanelRect(frame + "accent", card_x, y + 6, 5, est_lines * CF_LINE_H + 4, accent, accent);
+
    if(!s.enabled)
    {
-      Label(frame + "title", frame + "   Disabled", x, y, CF_DIM, true);
+      Label(frame + "title", frame + "  ·  Disabled", x, y + 8, CF_DIM, true);
       return 2;
    }
-   const bool ready = s.last_bar != 0;
-   const int header_y = y;
+   const int header_y = y + 8;
    Label(frame + "title", frame, x, header_y, accent, true);
-   Label(frame + "last", ready ? "last closed  " + FrameStamp(s.last_bar) : "waiting for closed-candle history",
-         x + 44, header_y, CF_DIM);
+   FrameStampRight(frame + "last", ready ? "last closed  " + FrameStamp(s.last_bar) : "waiting for closed-candle history",
+                   card_right, header_y, CF_DIM);
    ++lines;
-   if(!ready) return 2;
+   if(!ready)
+      return 2;
 
    string market = "Market: " + CFMarketName(s.local_market);
-   if(s.period == PERIOD_M5) market += "   ·   M15 context: " + CFMarketName(s.higher_market);
-   Label(frame + "market", market, x, y + CF_LINE_H * lines, CF_MUTED);
+   if(s.period == PERIOD_M5) market += "  ·  M15 context: " + CFMarketName(s.higher_market);
+   Label(frame + "market", market, x, y + 8 + CF_LINE_H * lines, CF_MUTED);
    ++lines;
 
-   Label(frame + "reading", CFCategoryName(s.reading.category) + "   ", x, y + CF_LINE_H * lines, CF_WHITE, true);
-   Label(frame + "reason", "·  " + s.reading.reason, x + 7 * StringLen(CFCategoryName(s.reading.category)) + 10,
-         y + CF_LINE_H * lines, CF_MUTED);
+   const string cat = CFCategoryName(s.reading.category);
+   Label(frame + "reading", cat, x, y + 8 + CF_LINE_H * lines, CF_WHITE, true);
+   Label(frame + "reason", "  ·  " + s.reading.reason, x + 10 * StringLen(cat) + 14,
+         y + 8 + CF_LINE_H * lines, CF_MUTED);
    ++lines;
+
+   const bool setup = s.plan.decision == CF_SETUP;
+   Label(frame + "cue", "Cue: " + CFDecisionName(s.plan), x, y + 8 + CF_LINE_H * lines,
+         setup ? accent : CF_MUTED, setup);
+   ++lines;
+   if(s.plan.qualifier != "")
+   {
+      Label(frame + "why", s.plan.qualifier, x, y + 8 + CF_LINE_H * lines, CF_DIM);
+      ++lines;
+   }
 
    const bool active = s.managed.forecast.status == CF_ACTIVE;
-   const string cue = active ? "Candle cue: " : "";
-   const string decision = ready ? cue + CFDecisionName(s.plan) + "   ·   " + s.plan.qualifier : "";
-   const color decision_color = s.plan.decision == CF_SETUP ? accent : CF_MUTED;
-   Label(frame + "decision", decision, x, y + CF_LINE_H * lines, decision_color);
-   ++lines;
-
    if(active)
    {
-      const string direction = s.managed.forecast.setup.direction > 0 ? "UP" : "DOWN";
-      Label(frame + "forecast",
-            "Active " + direction, x, y + CF_LINE_H * lines, CF_WHITE, true);
+      const string dir = s.managed.forecast.setup.direction > 0 ? "UP" : "DOWN";
+      const string head = "Active " + dir;
+      Label(frame + "forecast", head, x, y + 8 + CF_LINE_H * lines, CF_WHITE, true);
       Label(frame + "levels",
-            "Target " + PanelPrice(s.managed.forecast.setup.target) + "   ·   Invalidation " +
+            "Target " + PanelPrice(s.managed.forecast.setup.target) + "  ·  Invalidation " +
             PanelPrice(s.managed.forecast.setup.invalidation),
-            x + 90, y + CF_LINE_H * lines, CF_MUTED);
+            x + 10 * StringLen(head) + 16, y + 8 + CF_LINE_H * lines, CF_MUTED);
       ++lines;
+      const int yy = y + 8 + CF_LINE_H * lines;
       const double risk = MathAbs(s.managed.forecast.setup.entry - s.managed.forecast.setup.invalidation);
-      const double r_mult = risk > 0 ? s.managed.best_progress / risk : 0.0;
+      const double r_mult = risk > 0.0 ? s.managed.best_progress / risk : 0.0;
       Label(frame + "progress",
-            StringFormat("Bar %d/%d   ·   est %d-%d   ·   peak %+.2fR", s.managed.forecast.bars,
+            StringFormat("Bar %d/%d  ·  est %d-%d  ·  peak %+.2fR", s.managed.forecast.bars,
                          s.managed.forecast.setup.max_bars, s.managed.forecast.setup.min_bars,
                          s.managed.forecast.setup.max_bars, r_mult),
-            x, y + CF_LINE_H * lines, CF_MUTED);
+            x, yy, CF_MUTED);
+      const int track_w = 150, track_x = card_right - track_w - 16, track_y = yy + 5;
+      PanelRect(frame + "track", track_x, track_y, track_w, 10, CF_TRACK, CF_TRACK);
+      const double pct = s.managed.forecast.setup.max_bars > 0
+         ? MathMin(1.0, MathMax(0.0, (double)s.managed.forecast.bars / (double)s.managed.forecast.setup.max_bars))
+         : 0.0;
+      PanelRect(frame + "fill", track_x, track_y, MathMax(6, (int)(track_w * pct)), 10, accent, accent);
       ++lines;
    }
    else
@@ -1520,22 +1595,22 @@ int DrawStream(const CFStream &s, const int y)
       Label(frame + "forecast",
             s.waiting_for_new_close ? "Waiting for the next close to start forecasting"
                                     : "No active forecast — watching for setups",
-            x, y + CF_LINE_H * lines, CF_DIM);
+            x, y + 8 + CF_LINE_H * lines, CF_DIM);
       ++lines;
    }
 
-   Label(frame + "advice", CFAdviceName(s.managed.advice) + "   ·   " + s.managed.explanation,
-         x, y + CF_LINE_H * lines, AdviceInk(s.managed.advice));
+   Label(frame + "advice", CFAdviceName(s.managed.advice) + "  ·  " + s.managed.explanation,
+         x, y + 8 + CF_LINE_H * lines, AdviceInk(s.managed.advice), true);
    ++lines;
 
    color line_ink = CF_WARN;
    const string pos = PositionLine(s, line_ink);
    if(pos != "")
    {
-      Label(frame + "position", "●", x, y + CF_LINE_H * lines, line_ink);
-      Label(frame + "positiontext", pos, x + 16, y + CF_LINE_H * lines, CF_WHITE);
+      Label(frame + "position", "●", x, y + 8 + CF_LINE_H * lines, line_ink);
+      Label(frame + "positiontext", pos, x + 14, y + 8 + CF_LINE_H * lines, CF_WHITE, true);
       ++lines;
-      Label(frame + "positionsub", PositionBidAskLine(s), x + 16, y + CF_LINE_H * lines, CF_MUTED);
+      Label(frame + "positionsub", SlTpExitLine(s), x + 14, y + 8 + CF_LINE_H * lines, CF_MUTED);
       ++lines;
    }
    else
@@ -1543,15 +1618,15 @@ int DrawStream(const CFStream &s, const int y)
       const string pending = PendingLine(s, line_ink);
       if(pending != "")
       {
-         Label(frame + "pending", "●", x, y + CF_LINE_H * lines, line_ink);
-         Label(frame + "pendingtext", pending, x + 16, y + CF_LINE_H * lines, CF_WHITE);
+         Label(frame + "pending", "●", x, y + 8 + CF_LINE_H * lines, line_ink);
+         Label(frame + "pendingtext", pending, x + 14, y + 8 + CF_LINE_H * lines, CF_WHITE);
          ++lines;
       }
    }
 
    if(s.last_outcome != "")
    {
-      Label(frame + "outcome", "Last:  " + s.last_outcome, x, y + CF_LINE_H * lines, CF_DIM);
+      Label(frame + "outcome", "Last:  " + s.last_outcome, x, y + 8 + CF_LINE_H * lines, CF_DIM);
       ++lines;
    }
 
@@ -1563,27 +1638,13 @@ int DrawStream(const CFStream &s, const int y)
    return lines;
 }
 
-// One pulsing line shown when the market is closed/withheld.
+// Collapsed one-line mode for Withheld / Closed states.
 void DrawOnlyLine(const string line, const color ink)
 {
-   const string panel = CF_OBJECTS + "statuspanel";
-   const string dot = CF_OBJECTS + "statusdot";
-   const string label = CF_OBJECTS + "statusline";
    ObjectsDeleteAll(0, CF_OBJECTS);
-   PanelRect("statuspanel", 10, 16, CF_PANEL_W, 44, CF_BG, CF_BORDER);
-   ObjectCreate(0, dot, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dot, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-   ObjectSetInteger(0, dot, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
-   ObjectSetInteger(0, dot, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, dot, OBJPROP_HIDDEN, true);
-   ObjectSetString(0, dot, OBJPROP_TOOLTIP, "\n");
-   ObjectSetString(0, dot, OBJPROP_FONT, "Segoe UI");
-   ObjectSetInteger(0, dot, OBJPROP_FONTSIZE, 10);
-   ObjectSetInteger(0, dot, OBJPROP_COLOR, ink);
-   ObjectSetInteger(0, dot, OBJPROP_XDISTANCE, 24);
-   ObjectSetInteger(0, dot, OBJPROP_YDISTANCE, 30);
-   ObjectSetString(0, dot, OBJPROP_TEXT, "●");
-   Label("statusline", line, 42, 30, CF_WHITE, true);
+   PanelRect("statuspanel", CF_PANEL_X, CF_PANEL_Y, CF_PANEL_W, 46, CF_BG, CF_BORDER);
+   Label("statusdot", "●", CF_PANEL_X + 16, CF_PANEL_Y + 14, ink);
+   Label("statusline", line, CF_PANEL_X + 34, CF_PANEL_Y + 14, CF_WHITE, true);
    g_drawn_status = line;
    ChartRedraw(0);
 }
@@ -1592,7 +1653,9 @@ int StreamLineCount(const CFStream &s)
 {
    if(!s.enabled) return 2;
    if(s.last_bar == 0) return 2;
-   int lines = 6; // header, market, reading, decision, forecast, advice
+   int lines = 4; // title, market, reading, cue
+   if(s.plan.qualifier != "") ++lines;
+   ++lines; // forecast row
    if(s.managed.forecast.status == CF_ACTIVE) ++lines; // progress
    ulong ticket; int type; double price, sl, tp;
    if(FindAutoPosition(s, ticket, type, price, sl, tp)) lines += 2;
@@ -1611,7 +1674,7 @@ void HeartbeatStream(CFStream &s)
       if(ObjectFind(0, CF_OBJECTS + frame + "positiontext") >= 0)
          ObjectSetString(0, CF_OBJECTS + frame + "positiontext", OBJPROP_TEXT, pos);
       if(ObjectFind(0, CF_OBJECTS + frame + "positionsub") >= 0)
-         ObjectSetString(0, CF_OBJECTS + frame + "positionsub", OBJPROP_TEXT, PositionBidAskLine(s));
+         ObjectSetString(0, CF_OBJECTS + frame + "positionsub", OBJPROP_TEXT, SlTpExitLine(s));
       if(ObjectFind(0, CF_OBJECTS + frame + "position") >= 0)
          ObjectSetInteger(0, CF_OBJECTS + frame + "position", OBJPROP_COLOR, ink);
       return;
@@ -1623,11 +1686,29 @@ void HeartbeatStream(CFStream &s)
 
 void Heartbeat()
 {
-   if(ObjectFind(0, CF_OBJECTS + "footerclock") < 0) return;
-   ObjectSetString(0, CF_OBJECTS + "footerclock", OBJPROP_TEXT,
-                   "updated " + TimeToString(TimeCurrent(), TIME_SECONDS));
+   if(ObjectFind(0, CF_OBJECTS + "quotestrip") >= 0)
+      ObjectSetString(0, CF_OBJECTS + "quotestrip", OBJPROP_TEXT, QuoteStrip());
    HeartbeatStream(streams[0]);
    HeartbeatStream(streams[1]);
+}
+
+// True when the drawn position/pending lines no longer match reality — used to
+// redraw instantly on mid-bar open/fill/close instead of waiting for the bar.
+bool OrderUiMismatch()
+{
+   for(int i = 0; i < 2; ++i)
+   {
+      CFStream &s = streams[i];
+      if(!s.enabled) continue;
+      const string frame = FrameName(s.period);
+      ulong ticket; int type; double price, sl, tp;
+      const bool has_pos = FindAutoPosition(s, ticket, type, price, sl, tp);
+      const bool has_pend = !has_pos && s.auto_ticket != 0;
+      const bool drawn_pos = ObjectFind(0, CF_OBJECTS + frame + "positiontext") >= 0;
+      const bool drawn_pend = ObjectFind(0, CF_OBJECTS + frame + "pendingtext") >= 0;
+      if(has_pos != drawn_pos || has_pend != drawn_pend) return true;
+   }
+   return false;
 }
 
 void Draw()
@@ -1641,41 +1722,30 @@ void Draw()
    ObjectsDeleteAll(0, CF_OBJECTS);
    const int m5_lines = StreamLineCount(streams[0]);
    const int m15_lines = StreamLineCount(streams[1]);
-   const int header_h = 46;
-   const int y_m5 = 16 + header_h + CF_GAP;
-   const int y_m15 = y_m5 + m5_lines * CF_LINE_H + CF_GAP + 1 + CF_GAP;
-   const int footer_y = y_m15 + m15_lines * CF_LINE_H + CF_GAP + 1 + 8;
-   const int height = footer_y + 24;
-   PanelRect("panel", 10, 16, CF_PANEL_W, height, CF_BG, CF_BORDER);
+   const int strip_y = CF_PANEL_Y + CF_BAND_H + 8;      // 82
+   const int div1 = strip_y + 22;                        // 104
+   const int y_m5 = div1 + 10;                           // 114
+   const int y_m15 = y_m5 + m5_lines * CF_LINE_H + 16 + 14;
+   const int footer_y = y_m15 + m15_lines * CF_LINE_H + 16 + 10;
+   const int height = footer_y + 28;
+   PanelRect("panel", CF_PANEL_X, CF_PANEL_Y, CF_PANEL_W, height, CF_BG, CF_BORDER);
 
-   // Header — one glance: what this is, what the market says, what we're allowed to do.
-   Label("title", "TRADER  /  " + _Symbol, 24, 26, CF_WHITE, true);
-   const color auto_color = AutoTrading ? CF_WARN : CF_DIM;
-   string strip = "● " + (AutoTrading ? "AUTOTRADING ON" : "MONITOR ONLY");
-   strip += "    ·    CSV " + ((SaveCsv && !(log_error[0] || log_error[1])) ? "on" : (SaveCsv ? "error" : "off"));
-   int live = 0;
-   ulong t; int ty; double p, slx, tpx;
-   if(FindAutoPosition(streams[0], t, ty, p, slx, tpx)) ++live;
-   if(FindAutoPosition(streams[1], t, ty, p, slx, tpx)) ++live;
-   const int pendings = (streams[0].auto_ticket != 0 ? 1 : 0) + (streams[1].auto_ticket != 0 ? 1 : 0);
-   strip += "    ·    ";
-   if(live == 0 && pendings == 0) strip += "flat";
-   else
-   {
-      if(live > 0) strip += IntegerToString(live) + (live == 1 ? " position" : " positions");
-      if(live > 0 && pendings > 0) strip += "  ·  ";
-      if(pendings > 0) strip += IntegerToString(pendings) + (pendings == 1 ? " pending" : " pendings");
-   }
-   strip += "    ·    " + g_market_text;
-   Label("status", strip, 24, 48, auto_color, true);
-   Divider("headerdv", 16 + header_h);
+   // Header band: who we are + a live quote, always ticking.
+   PanelRect("band", CF_PANEL_X, CF_PANEL_Y, CF_PANEL_W, CF_BAND_H, CF_BAND, CF_BAND);
+   Label("title", "TRADER", CF_PANEL_X + 16, CF_PANEL_Y + 8, CF_WHITE, true);
+   const int symbol_x = CF_PANEL_X + CF_PANEL_W - 16 - (int)(9.0 * StringLen(_Symbol)) - 4;
+   Label("symbol", _Symbol, symbol_x, CF_PANEL_Y + 8, CF_MUTED, true);
+   Label("quotestrip", QuoteStrip(), CF_PANEL_X + 16, CF_PANEL_Y + 32, CF_WHITE);
+
+   // Status strip (never truncated: short chips, fixed width budget).
+   Label("statusdot", "●", CF_PANEL_X + 16, strip_y, AutoTrading ? CF_WARN : CF_DIM);
+   Label("status", StatusStrip(), CF_PANEL_X + 32, strip_y, CF_WHITE, true);
+   Divider("dv1", div1);
 
    DrawStream(streams[0], y_m5);
-   Divider("middv", y_m5 + m5_lines * CF_LINE_H + CF_GAP);
    DrawStream(streams[1], y_m15);
-   Divider("footdv", footer_y - 8);
-   Label("footer", "Candle Forecast  ·  closed-candle M5 / M15 reading", 24, footer_y, CF_DIM);
-   Label("footerclock", "updated " + TimeToString(TimeCurrent(), TIME_SECONDS), 560, footer_y, CF_DIM);
+   Divider("footdv", footer_y - 9);
+   Label("footer", "Candle Forecast  ·  closed-candle M5 / M15 reading", CF_PANEL_X + 16, footer_y, CF_DIM);
 
    g_drawn_status = g_market_text;
    ChartRedraw(0);
@@ -1775,8 +1845,8 @@ void Refresh()
    const bool m15_changed = UpdateStream(streams[1]);
    if(m5_changed || m15_changed) SaveStateAll();
    AutoOrdersSweep();
-   AutoExits(streams[0]);
-   AutoExits(streams[1]);
+   AutoExits(streams[0], m5_changed);
+   AutoExits(streams[1], m15_changed);
    if(show_panel)
    {
       // Panel self-heal: if MT5 destroyed the chart objects (timeframe switch), rebuild them.
@@ -1786,7 +1856,8 @@ void Refresh()
          : (ObjectFind(0, CF_OBJECTS + "panel") < 0 ||
             ObjectFind(0, CF_OBJECTS + "M5title") < 0 ||
             ObjectFind(0, CF_OBJECTS + "M15title") < 0);
-      if(missing || m5_changed || m15_changed || g_market_text != g_drawn_status) Draw();
+      if(missing || m5_changed || m15_changed || g_market_text != g_drawn_status ||
+         (!line_mode && OrderUiMismatch())) Draw();
       if(TimeCurrent() != g_last_beat)
       {
          g_last_beat = TimeCurrent();
