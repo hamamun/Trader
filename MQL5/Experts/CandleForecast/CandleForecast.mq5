@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.45"
+#property version   "1.46"
 #property description "Closed-candle M5/M15 forecasts. Monitor only; does not send orders."
 
 #include "CandleLogic.mqh"
@@ -143,13 +143,13 @@ void UpdateMarketStatus()
 
    const long trade_mode = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
    if(trade_mode == SYMBOL_TRADE_MODE_DISABLED)
-      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Trade disabled by broker"; g_market_color = orange; return; }
+      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Trade disabled by broker | Monitoring continues"; g_market_color = orange; return; }
    if(trade_mode == SYMBOL_TRADE_MODE_CLOSEONLY)
-      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Close-only mode"; g_market_color = orange; return; }
+      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Close-only mode | Monitoring continues"; g_market_color = orange; return; }
    if(trade_mode == SYMBOL_TRADE_MODE_LONGONLY)
-      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Long-only mode"; g_market_color = orange; return; }
+      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Long-only mode | Monitoring continues"; g_market_color = orange; return; }
    if(trade_mode == SYMBOL_TRADE_MODE_SHORTONLY)
-      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Short-only mode"; g_market_color = orange; return; }
+      { g_market_status = CM_WITHHELD; g_market_text = "Withheld | Short-only mode | Monitoring continues"; g_market_color = orange; return; }
    if(!SessionsDefined())
       { g_market_status = CM_OPEN; g_market_text = "Market open | 24/7"; g_market_color = green; return; }
    if(InTradeSession(when))
@@ -865,7 +865,7 @@ void DrawStream(const CFStream &s, const int y)
 void Draw()
 {
    UpdateMarketStatus();
-   if(g_market_status == CM_CLOSED)
+   if(g_market_status == CM_CLOSED || g_market_status == CM_WITHHELD)
    {
       DrawOnlyLine(g_market_text, g_market_color);
       return;
@@ -950,7 +950,7 @@ void Refresh()
       if(!g_market_was_closed)
       {
          g_market_was_closed = true;
-         Print("Candle Forecast: market closed; monitoring paused (", g_market_text, ").");
+         Print("Candle Forecast: market closed; monitoring paused.");
       }
       if(show_panel) DrawOnlyLine(g_market_text, g_market_color);
       return;
