@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.58"
+#property version   "1.59"
 #property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
 #include <Trade/Trade.mqh>
@@ -1709,21 +1709,21 @@ void Heartbeat()
 
 // True when the drawn position/pending lines no longer match reality — used to
 // redraw instantly on mid-bar open/fill/close instead of waiting for the bar.
+bool OrderUiMismatchStream(CFStream &s)
+{
+   if(!s.enabled) return false;
+   const string frame = FrameName(s.period);
+   ulong ticket; int type; double price, sl, tp;
+   const bool has_pos = FindAutoPosition(s, ticket, type, price, sl, tp);
+   const bool has_pend = !has_pos && s.auto_ticket != 0;
+   const bool drawn_pos = ObjectFind(0, CF_OBJECTS + frame + "positiontext") >= 0;
+   const bool drawn_pend = ObjectFind(0, CF_OBJECTS + frame + "pendingtext") >= 0;
+   return has_pos != drawn_pos || has_pend != drawn_pend;
+}
+
 bool OrderUiMismatch()
 {
-   for(int i = 0; i < 2; ++i)
-   {
-      CFStream &s = streams[i];
-      if(!s.enabled) continue;
-      const string frame = FrameName(s.period);
-      ulong ticket; int type; double price, sl, tp;
-      const bool has_pos = FindAutoPosition(s, ticket, type, price, sl, tp);
-      const bool has_pend = !has_pos && s.auto_ticket != 0;
-      const bool drawn_pos = ObjectFind(0, CF_OBJECTS + frame + "positiontext") >= 0;
-      const bool drawn_pend = ObjectFind(0, CF_OBJECTS + frame + "pendingtext") >= 0;
-      if(has_pos != drawn_pos || has_pend != drawn_pend) return true;
-   }
-   return false;
+   return OrderUiMismatchStream(streams[0]) || OrderUiMismatchStream(streams[1]);
 }
 
 void Draw()
