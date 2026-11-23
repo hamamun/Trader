@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.55"
+#property version   "1.56"
 #property description "Closed-candle M5/M15 forecasts. Monitor-only unless the AutoTrading input is on; can place and manage entries."
 
 #include <Trade/Trade.mqh>
@@ -1381,7 +1381,7 @@ void Label(const string suffix, const string text, const int x, const int y,
 
 string FrameStamp(const datetime value)
 {
-   return TimeToString(value, TIME_HOURS | TIME_MINUTES);
+   return TimeToString(value, TIME_MINUTES); // hh:mi
 }
 
 color AdviceInk(const CFAdvice advice)
